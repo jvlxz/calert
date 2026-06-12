@@ -109,6 +109,7 @@ Example:
 | `Replace` | Replace all occurrences | `{{ Replace .Labels.instance ":" "_" }}` |
 | `TrimSpace` | Trim whitespace | `{{ .Annotations.description \| TrimSpace }}` |
 | `Default` | Provide default value | `{{ .Annotations.runbook \| Default "No runbook" }}` |
+| `JSONEscape` | Escape text for CardsV2 JSON strings | `{{ .Annotations.summary \| JSONEscape }}` |
 | `reReplaceAll` | Regex replace | `{{ reReplaceAll "\\d+" "X" .Labels.instance }}` |
 | `CurrentTime` | Current time (optional timezone) | `{{ CurrentTime "Asia/Kolkata" }}` |
 | `ConvertTZ` | Convert time to timezone | `{{ ConvertTZ .StartsAt "America/New_York" }}` |
@@ -121,19 +122,25 @@ For rich formatting with colors and structured layouts, use Google Chat's [Cards
 ```
 {{- define "cardsV2" -}}
 {
-  "cardId": "alert-{{ .Fingerprint }}",
+  "cardId": "alert-{{ .TrackingKey | JSONEscape }}",
   "card": {
     "header": {
-      "title": "{{ .Labels.alertname }}",
-      "subtitle": "{{ .Status | Title }}"
+      "title": "{{ .AlertName | JSONEscape }}",
+      "subtitle": "{{ .Status | Title | JSONEscape }} | {{ .FiringCount }} firing / {{ .ResolvedCount }} resolved"
     },
-    "sections": [{
-      "widgets": [{
-        "decoratedText": {
-          "text": "{{ .Annotations.description }}"
-        }
-      }]
-    }]
+    "sections": [
+      {{- range $i, $alert := .Alerts }}
+      {{- if ne $i 0 }},{{ end }}
+      {
+        "header": "Instance {{ $alert.Labels.instance | JSONEscape }}",
+        "widgets": [{
+          "textParagraph": {
+            "text": "<b>{{ $alert.Status | toUpper | JSONEscape }}</b><br>{{ $alert.Annotations.summary | Default `N/A` | JSONEscape }}"
+          }
+        }]
+      }
+      {{- end }}
+    ]
   }
 }
 {{- end -}}

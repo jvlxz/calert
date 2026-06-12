@@ -2,6 +2,7 @@ package google_chat
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -125,6 +126,14 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 				return defaultVal
 			}
 			return val
+		},
+		"JSONEscape": func(v any) string {
+			out, err := json.Marshal(fmt.Sprintf("%v", v))
+			if err != nil {
+				return ""
+			}
+			escaped := string(out)
+			return strings.Trim(escaped, `"`)
 		},
 		"reReplaceAll": func(pattern, repl, text string) string {
 			re := regexp.MustCompile(pattern)

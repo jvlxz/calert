@@ -417,6 +417,22 @@ func TestActiveAlerts(t *testing.T) {
 		assert.Equal(t, 3, groups[0].Count)
 		assert.Equal(t, 0, groups[0].FiringCount)
 		assert.Equal(t, 3, groups[0].ResolvedCount)
+		threadKey := groups[0].ThreadKey
+		assert.Len(t, aa.alerts["PrometheusTargetTimeout"].Alerts, 0)
+
+		newIncident := alerts[0]
+		newIncident.Status = "firing"
+		newIncident.Fingerprint = "fingerprint-4"
+		newIncident.Labels["instance"] = "prometheus-4"
+		groups, err = aa.apply([]alertmgrtmpl.Alert{newIncident})
+		require.NoError(t, err)
+		require.Len(t, groups, 1)
+		assert.Equal(t, threadKey, groups[0].ThreadKey)
+		assert.Equal(t, "firing", groups[0].Status)
+		assert.Equal(t, 1, groups[0].Count)
+		assert.Equal(t, 1, groups[0].FiringCount)
+		assert.Equal(t, 0, groups[0].ResolvedCount)
+		assert.Equal(t, "fingerprint-4", groups[0].Alerts[0].Fingerprint)
 	})
 
 	t.Run("apply groups payload by alertname and preserves first seen group order", func(t *testing.T) {
@@ -810,4 +826,77 @@ func TestPrepareMessage(t *testing.T) {
 		assert.Contains(t, widgets[0].TextParagraph.Text, "prometheus-1=firing")
 		assert.Contains(t, widgets[0].TextParagraph.Text, "prometheus-2=resolved")
 	})
+}
+
+func TestBundledMessageCardTemplateAggregatesAlerts(t *testing.T) {
+	chat, err := NewGoogleChat(GoogleChatOpts{
+		Log:      slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		Endpoint: "http://test",
+		Room:     "test",
+		Template: "../../../static/message-card.tmpl",
+	})
+	require.NoError(t, err)
+
+	alerts := []alertmgrtmpl.Alert{
+		{
+			Status:       "firing",
+			Fingerprint:  "target-1",
+			GeneratorURL: "https://prometheus.example.com/graph?g0.expr=up",
+			Labels: alertmgrtmpl.KV{
+				"alertname": "PrometheusTargetMissing",
+				"severity":  "warning",
+				"team":      "team-infrastructure",
+				"instance":  "cdn1-node1.dv.par5.numberly.net:9100",
+			},
+			Annotations: alertmgrtmpl.KV{
+				"summary": "Prometheus /metrics scrape target unavailable (instance cdn1-node1.dv.par5.numberly.net:9100)",
+			},
+		},
+		{
+			Status:      "resolved",
+			Fingerprint: "target-2",
+			Labels: alertmgrtmpl.KV{
+				"alertname": "PrometheusTargetMissing",
+				"severity":  "warning",
+				"team":      "team-infrastructure",
+				"instance":  "cdn1-node2.dv.par5.numberly.net:9100",
+			},
+			Annotations: alertmgrtmpl.KV{
+				"summary": "Target recovered with \"quoted\" output",
+			},
+		},
+	}
+	group := AlertGroup{
+		Alert:         alerts[0],
+		Alerts:        alerts,
+		Count:         2,
+		FiringCount:   1,
+		ResolvedCount: 1,
+		TrackingKey:   "PrometheusTargetMissing",
+		AlertName:     "PrometheusTargetMissing",
+		ThreadKey:     "thread-key",
+	}
+	group.Status = "firing"
+
+	msgs, err := chat.prepareMessage(group)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Len(t, msgs[0].CardsV2, 1)
+
+	card := msgs[0].CardsV2[0].Card
+	require.NotNil(t, card)
+	require.NotNil(t, card.Header)
+	assert.Contains(t, card.Header.Title, "PrometheusTargetMissing")
+	assert.Contains(t, card.Header.Subtitle, "1 firing / 1 resolved")
+	require.Len(t, card.Sections, 3)
+
+	assert.Contains(t, card.Sections[1].Header, "cdn1-node1.dv.par5.numberly.net:9100")
+	require.Len(t, card.Sections[1].Widgets, 3)
+	assert.Contains(t, card.Sections[1].Widgets[0].TextParagraph.Text, "FIRING")
+	assert.Contains(t, card.Sections[1].Widgets[0].TextParagraph.Text, "Prometheus /metrics scrape target unavailable")
+
+	assert.Contains(t, card.Sections[2].Header, "cdn1-node2.dv.par5.numberly.net:9100")
+	require.Len(t, card.Sections[2].Widgets, 3)
+	assert.Contains(t, card.Sections[2].Widgets[0].TextParagraph.Text, "RESOLVED")
+	assert.Contains(t, card.Sections[2].Widgets[0].TextParagraph.Text, "Target recovered with \"quoted\" output")
 }

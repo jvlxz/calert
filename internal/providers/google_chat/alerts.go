@@ -114,8 +114,14 @@ func (d *ActiveAlerts) apply(alerts []alertmgrtmpl.Alert) ([]AlertGroup, error) 
 			details.Alerts[alertKey] = alert
 		}
 
+		group := details.group(key)
+		if group.FiringCount == 0 {
+			details.Alerts = make(map[string]alertmgrtmpl.Alert)
+			details.Order = nil
+		}
+
 		d.alerts[key] = details
-		groups = append(groups, details.group(key))
+		groups = append(groups, group)
 	}
 
 	return groups, nil
@@ -138,18 +144,21 @@ func (d AlertDetails) group(key string) AlertGroup {
 		AlertName:   key,
 		ThreadKey:   d.UUID.String(),
 	}
-	if len(alerts) > 0 {
-		group.Alert = alerts[0]
-		group.Status = "resolved"
-	}
+	group.Status = "resolved"
 
 	for _, alert := range alerts {
 		switch alert.Status {
 		case "resolved":
 			group.ResolvedCount++
+			if group.Alert.Fingerprint == "" {
+				group.Alert = alert
+			}
 		default:
 			group.FiringCount++
 			group.Status = "firing"
+			if group.Alert.Fingerprint == "" || group.Alert.Status == "resolved" {
+				group.Alert = alert
+			}
 		}
 	}
 

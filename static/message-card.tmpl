@@ -1,20 +1,66 @@
 {{- define "cardsV2" -}}
+{{- $isFiring := eq .Status "firing" -}}
+{{- $severity := .Labels.severity | toLower -}}
+{{- $statusIcon := "🟢" -}}
+{{- if $isFiring -}}
+  {{- if eq $severity "critical" -}}
+    {{- $statusIcon = "🔴" -}}
+  {{- else if eq $severity "critical-daytime" -}}
+    {{- $statusIcon = "🟣" -}}
+  {{- else if eq $severity "warning" -}}
+    {{- $statusIcon = "🟡" -}}
+  {{- else if eq $severity "information" -}}
+    {{- $statusIcon = "🔵" -}}
+  {{- end -}}
+{{- end -}}
 {
+  "cardId": "alert-{{ .TrackingKey | JSONEscape }}",
   "card": {
+    "header": {
+      "title": "{{ $statusIcon }} <b>{{ .AlertName | JSONEscape }}</b>",
+      "subtitle": "{{ .Status | Title | JSONEscape }} | {{ .Labels.severity | toUpper | JSONEscape }} | {{ .Labels.team | Default `unknown` | JSONEscape }} | {{ .FiringCount }} firing / {{ .ResolvedCount }} resolved"
+    },
     "sections": [
       {
-        "header": "<b>({{.Labels.severity | toUpper }}) {{ .Labels.alertname | Title }} - {{.Status | Title }}</b>",
         "widgets": [
-          {{- range $i, $pair := .Annotations.SortedPairs -}}
-          {{- if ne $i 0 -}},{{- end -}}
           {
-            "decoratedText": {
-              "text": "{{ $pair.Name | Title }}: {{ $pair.Value}}"
+            "buttonList": {
+              "buttons": [
+                {
+                  "text": "📈 Prometheus",
+                  "onClick": { "openLink": { "url": "{{ .GeneratorURL | Default `https://prometheus.example.com` | JSONEscape }}" } }
+                }{{ if .Annotations.documentation }},
+                {
+                  "text": "📖 Handbook",
+                  "onClick": { "openLink": { "url": "{{ .Annotations.documentation | JSONEscape }}" } }
+                }{{ end }}
+              ]
             }
           }
-          {{- end -}}
         ]
-      }
+      }{{ range $i, $alert := .Alerts }},
+      {
+        "header": "Instance 📍 {{ $alert.Labels.pod | Default $alert.Labels.instance | Default `No pod or instance specified` | JSONEscape }}",
+        "collapsible": true,
+        "uncollapsibleWidgetsCount": 1,
+        "widgets": [
+          {
+            "textParagraph": {
+              "text": "{{ if eq $alert.Status `firing` }}🔴 <font color=\"#d93025\"><b>FIRING</b></font>{{ else }}🟢 <font color=\"#1e8e3e\"><b>RESOLVED</b></font>{{ end }}{{ if $alert.Labels.namespace }} | NS: <code>{{ $alert.Labels.namespace | JSONEscape }}</code>{{ end }}<br><b>Summary:</b> {{ $alert.Annotations.summary | Default `N/A` | JSONEscape }}"
+            }
+          },
+          {
+            "textParagraph": {
+              "text": "<b>Labels</b><br>{{ range $alert.Labels.SortedPairs }}• {{ .Name | JSONEscape }} = <code>{{ .Value | JSONEscape }}</code><br>{{ end }}"
+            }
+          },
+          {
+            "textParagraph": {
+              "text": "<b>Annotations</b><br>{{ range $alert.Annotations.SortedPairs }}• {{ .Name | JSONEscape }} = <code>{{ .Value | JSONEscape }}</code><br>{{ end }}"
+            }
+          }
+        ]
+      }{{ end }}
     ]
   }
 }
