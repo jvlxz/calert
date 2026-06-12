@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"strings"
 
-	alertmgrtmpl "github.com/prometheus/alertmanager/template"
 	chatv1 "google.golang.org/api/chat/v1"
 )
 
@@ -20,7 +19,7 @@ const (
 // prepareMessage accepts an Alert object and templates out with the user provided template.
 // It also splits the alerts if the combined size exceeds the limit of 4096 bytes by
 // G-Chat Webhook API
-func (m *GoogleChatManager) prepareMessage(alert alertmgrtmpl.Alert) ([]chatv1.Message, error) {
+func (m *GoogleChatManager) prepareMessage(group AlertGroup) ([]chatv1.Message, error) {
 	var (
 		str    strings.Builder
 		toText bytes.Buffer
@@ -32,13 +31,13 @@ func (m *GoogleChatManager) prepareMessage(alert alertmgrtmpl.Alert) ([]chatv1.M
 	messages := make([]chatv1.Message, 0)
 
 	// Render a template with alert data.
-	err := m.msgTmpl.Execute(&toText, alert)
+	err := m.msgTmpl.Execute(&toText, group)
 	if err != nil {
 		m.lo.Error("Error parsing values in template", "error", err)
 		return messages, err
 	}
 	if m.msgTmpl.Lookup("cardsV2") != nil {
-		err = m.msgTmpl.ExecuteTemplate(&toCard, "cardsV2", alert)
+		err = m.msgTmpl.ExecuteTemplate(&toCard, "cardsV2", group)
 		if err != nil {
 			m.lo.Error("Error parsing values in template", "error", err)
 			return messages, err

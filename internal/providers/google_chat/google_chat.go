@@ -187,21 +187,22 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 func (m *GoogleChatManager) Push(alerts []alertmgrtmpl.Alert) error {
 	m.lo.Info("dispatching alerts to google chat", "count", len(alerts))
 
-	// For each alert, lookup the UUID and send the alert.
-	for _, a := range alerts {
+	groups, err := m.activeAlerts.apply(alerts)
+	if err != nil {
+		m.lo.Error("error preparing google chat alert groups", "error", err)
+		m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="preparing"}`, m.ID(), m.Room()))
+		return nil
+	}
+
+	// For each alert group, render the current known instances and send them to
+	// the group's thread.
+	for _, group := range groups {
 		now := time.Now()
 
 		m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_total{provider="%s", room="%s"}`, m.ID(), m.Room()))
 
-		threadKey, err := m.activeAlerts.threadKey(a)
-		if err != nil {
-			m.lo.Error("error getting google chat thread key", "error", err)
-			m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="preparing"}`, m.ID(), m.Room()))
-			continue
-		}
-
 		// Prepare a list of messages to send.
-		msgs, err := m.prepareMessage(a)
+		msgs, err := m.prepareMessage(group)
 		if err != nil {
 			m.lo.Error("error preparing message", "error", err)
 			m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="preparing"}`, m.ID(), m.Room()))
@@ -214,7 +215,7 @@ func (m *GoogleChatManager) Push(alerts []alertmgrtmpl.Alert) error {
 			if m.dryRun {
 				m.lo.Info("dry_run is enabled for this room. skipping pushing notification", "room", m.Room())
 			} else {
-				if err := m.sendMessage(msg, threadKey); err != nil {
+				if err := m.sendMessage(msg, group.ThreadKey); err != nil {
 					m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="sending"}`, m.ID(), m.Room()))
 					m.lo.Error("error sending message", "error", err)
 					continue

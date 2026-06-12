@@ -12,7 +12,6 @@ import (
 )
 
 // ActiveAlerts represents a map of active alert tracking keys.
-// with their details.
 type ActiveAlerts struct {
 	lo      *slog.Logger
 	metrics *metrics.Manager
@@ -20,11 +19,25 @@ type ActiveAlerts struct {
 	alerts map[string]AlertDetails
 }
 
-// AlertDetails represents some internal fields required
-// for dispatching alerts or cleaning up based on TTL.
+// AlertDetails stores the Google Chat thread and current known instances for a
+// tracking key.
 type AlertDetails struct {
 	StartsAt time.Time
 	UUID     uuid.UUID
+	Alerts   map[string]alertmgrtmpl.Alert
+	Order    []string
+}
+
+// AlertGroup is the template context for a consolidated Google Chat message.
+type AlertGroup struct {
+	alertmgrtmpl.Alert
+	Alerts        []alertmgrtmpl.Alert
+	Count         int
+	FiringCount   int
+	ResolvedCount int
+	TrackingKey   string
+	AlertName     string
+	ThreadKey     string
 }
 
 func trackingKey(a alertmgrtmpl.Alert) string {
@@ -35,67 +48,144 @@ func trackingKey(a alertmgrtmpl.Alert) string {
 	return a.Fingerprint
 }
 
-// threadKey returns the Google Chat thread key for an alert, creating one if
-// this tracking key is not active yet.
-func (d *ActiveAlerts) threadKey(a alertmgrtmpl.Alert) (string, error) {
+func instanceKey(a alertmgrtmpl.Alert) string {
+	if a.Fingerprint != "" {
+		return a.Fingerprint
+	}
+
+	return trackingKey(a)
+}
+
+func groupAlerts(alerts []alertmgrtmpl.Alert) []string {
+	groups := make([]string, 0)
+	seen := make(map[string]struct{})
+
+	for _, alert := range alerts {
+		key := trackingKey(alert)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+
+		seen[key] = struct{}{}
+		groups = append(groups, key)
+	}
+
+	return groups
+}
+
+// apply updates the current known instance state for each incoming alert group
+// and returns snapshots ready for template rendering.
+func (d *ActiveAlerts) apply(alerts []alertmgrtmpl.Alert) ([]AlertGroup, error) {
 	d.Lock()
 	defer d.Unlock()
 
-	key := trackingKey(a)
-	if details, ok := d.alerts[key]; ok {
-		return details.UUID.String(), nil
+	groupOrder := groupAlerts(alerts)
+	updatedGroups := make(map[string][]alertmgrtmpl.Alert, len(groupOrder))
+	for _, alert := range alerts {
+		key := trackingKey(alert)
+		updatedGroups[key] = append(updatedGroups[key], alert)
 	}
 
-	// Create a UUID for the alert. This UUID is used as threadKey param for the
-	// G-Chat API.
-	uid, err := uuid.NewV4()
+	groups := make([]AlertGroup, 0, len(groupOrder))
+	for _, key := range groupOrder {
+		details, ok := d.alerts[key]
+		if !ok {
+			uid, err := uuid.NewV4()
+			if err != nil {
+				return groups, err
+			}
+
+			details = AlertDetails{
+				StartsAt: updatedGroups[key][0].StartsAt,
+				UUID:     uid,
+				Alerts:   make(map[string]alertmgrtmpl.Alert),
+				Order:    make([]string, 0, len(updatedGroups[key])),
+			}
+		}
+		if details.Alerts == nil {
+			details.Alerts = make(map[string]alertmgrtmpl.Alert)
+		}
+
+		for _, alert := range updatedGroups[key] {
+			alertKey := instanceKey(alert)
+			if _, exists := details.Alerts[alertKey]; !exists {
+				details.Order = append(details.Order, alertKey)
+			}
+			details.Alerts[alertKey] = alert
+		}
+
+		d.alerts[key] = details
+		groups = append(groups, details.group(key))
+	}
+
+	return groups, nil
+}
+
+func (d AlertDetails) group(key string) AlertGroup {
+	alerts := make([]alertmgrtmpl.Alert, 0, len(d.Order))
+	for _, alertKey := range d.Order {
+		alert, ok := d.Alerts[alertKey]
+		if !ok {
+			continue
+		}
+		alerts = append(alerts, alert)
+	}
+
+	group := AlertGroup{
+		Alerts:      alerts,
+		Count:       len(alerts),
+		TrackingKey: key,
+		AlertName:   key,
+		ThreadKey:   d.UUID.String(),
+	}
+	if len(alerts) > 0 {
+		group.Alert = alerts[0]
+		group.Status = "resolved"
+	}
+
+	for _, alert := range alerts {
+		switch alert.Status {
+		case "resolved":
+			group.ResolvedCount++
+		default:
+			group.FiringCount++
+			group.Status = "firing"
+		}
+	}
+
+	return group
+}
+
+// threadKey returns the Google Chat thread key for an alert.
+func (d *ActiveAlerts) threadKey(a alertmgrtmpl.Alert) (string, error) {
+	groups, err := d.apply([]alertmgrtmpl.Alert{a})
 	if err != nil {
 		return "", err
 	}
-
-	d.alerts[key] = AlertDetails{
-		UUID:     uid,
-		StartsAt: a.StartsAt,
+	if len(groups) == 0 {
+		return "", nil
 	}
 
-	return uid.String(), nil
+	return groups[0].ThreadKey, nil
 }
 
-// add adds an alert to the active alerts map.
 func (d *ActiveAlerts) add(a alertmgrtmpl.Alert) error {
-	d.Lock()
-	defer d.Unlock()
-
-	// Create a UUID for the alert. This UUID is
-	// sent as a `threadKey` param in G-Chat API.
-	// Set UUID for the alert.
-	uid, err := uuid.NewV4()
-	if err != nil {
-		return err
-	}
-
-	// Add the alert metadata to the map.
-	d.alerts[trackingKey(a)] = AlertDetails{
-		UUID:     uid,
-		StartsAt: a.StartsAt,
-	}
-
-	return nil
+	_, err := d.apply([]alertmgrtmpl.Alert{a})
+	return err
 }
 
-// loookup retrievs the UUID for the alert based on the tracking key.
+// loookup returns the Google Chat thread key UUID for a tracking key.
 func (d *ActiveAlerts) loookup(trackingKey string) string {
 	d.RLock()
 	defer d.RUnlock()
 
-	// Do a lookup for the provider by the room name and push the alerts.
 	if _, ok := d.alerts[trackingKey]; !ok {
 		return ""
 	}
 	return d.alerts[trackingKey].UUID.String()
 }
 
-// Prune iterates on a list of active alerts inside the map
+// Prune iterates the list of active alerts inside the map
 // and deletes them if they exceed the specified TTL.
 func (d *ActiveAlerts) Prune(ttl time.Duration) {
 	d.Lock()
@@ -106,35 +196,37 @@ func (d *ActiveAlerts) Prune(ttl time.Duration) {
 		expired = now.Add(-ttl)
 	)
 
-	// Iterate on map of active alerts.
 	for k, a := range d.alerts {
-		// If the alert creation field is past our specified TTL, remove it from the map.
 		if a.StartsAt.Before(expired) {
 			d.lo.Debug("removing alert from active alerts", "tracking_key", k, "created", a.StartsAt, "expired", expired)
 			delete(d.alerts, k)
 		}
 	}
-
 	d.metrics.Duration(`alerts_prune_duration_seconds`, now)
-
 }
 
 // InitPruner is used to remove active alerts in the
-// map once their TTL is reached. The cleanup activity happens at periodic intervals.
-// This is a blocking function so the caller must invoke as a goroutine.
-// The reason for this background worker is
-// 1) Alertmanager doesn't have any unique ID for a generated alert. The use case is to send
-// all the future alerts for same labels in a same thread. Labels are computed via `.fingerprint` field which is a
-// unique hash based on those labels. The problem here is that all future alerts for same labels will also have same
-// fingerprint. This means that even after the status is Resolved, we will continue posting to same thread if we use this
-// fingerprint. This is undesirable, we ideally want each thread to have the last message as "Resolved".
-// Now since there's no unique field, we maintain a map of active alerts. All the alerts will be stored here for a specified
-// TTL.
-// 2) Since we are storing the alerts in a map, this map will continue to grow unbounded.
-// We need to have a TTL based expiry for these map keys. This is the most simple implementation to prune alerts by running this
-// function as a GoRoutine and check if the alert creation timestamp has crossed our specified TTL. If it has, it'll delete the alert
-// entry from the map.
-// This check happens at a periodic interval specified by `pruneInterval` by the caller.
+// map once their TTL is reached. The cleanup occurs at periodic intervals.
+// This is a blocking function and caller must invoke it in a goroutine.
+//
+// Alertmanager doesn't have any unique ID for a generated alert. This is
+// important to send all future alerts for same labels to the same thread. Labels
+// are computed via `.fingerprint` field which gives a unique hash for the same
+// alerts. Hence all future alerts for the same will have the same fingerprint.
+// This approach is however unstable if the alert label changes slightly in the
+// future. This will generate a new fingerprint hash.
+//
+// Hence, even after the status of the alert is marked as Resolved, we continue
+// posting to the same thread instead of a new thread. However, if we don't expire
+// the map, then it can cause high memory usage especially in high workload
+// environments which generates a lot of alerts. We use a TTL based expiry for
+// these map keys. By default the TTL is set to 12 hours. The user can configure
+// it via `thread_ttl` config option.
+//
+// The pruner will help to prune the alerts by running this function as a
+// goroutine and check if the alert creation timestamp has crossed our specified
+// TTL. If it has, it'll delete the alert entry from the map. The cleanup check
+// happens at a periodic interval specified by `pruneInterval`.
 func (d *ActiveAlerts) startPruneWorker(pruneInterval time.Duration, ttl time.Duration) {
 	var (
 		evalTicker = time.NewTicker(pruneInterval).C

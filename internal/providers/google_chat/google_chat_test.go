@@ -2,6 +2,7 @@ package google_chat
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -129,13 +130,33 @@ func TestGoogleChatTemplate(t *testing.T) {
 
 	expectedMessage := "*(HIGH) Testalert - Firing*\nDryrun: true\nTeam: qa\n\n"
 
-	msgs, err := chat.prepareMessage(alert)
+	msgs, err := chat.prepareMessage(testAlertGroup(alert))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	assert.Equal(t, "message.tmpl", filepath.Base(chat.msgTmpl.Name()), "Message template name")
 	assert.Equal(t, expectedMessage, msgs[0].Text, "Message content")
+}
+
+func testAlertGroup(alert alertmgrtmpl.Alert) AlertGroup {
+	group := AlertGroup{
+		Alert:       alert,
+		Alerts:      []alertmgrtmpl.Alert{alert},
+		Count:       1,
+		TrackingKey: trackingKey(alert),
+		AlertName:   trackingKey(alert),
+		ThreadKey:   "thread-key",
+	}
+	if alert.Status == "resolved" {
+		group.ResolvedCount = 1
+		group.Status = "resolved"
+	} else {
+		group.FiringCount = 1
+		group.Status = "firing"
+	}
+
+	return group
 }
 
 func TestTemplateFunctions(t *testing.T) {
@@ -328,6 +349,144 @@ func TestActiveAlerts(t *testing.T) {
 		assert.Equal(t, first, aa.loookup("HighLatency"))
 	})
 
+	t.Run("apply merges instances by alertname and keeps resolved instances", func(t *testing.T) {
+		aa := &ActiveAlerts{
+			alerts: make(map[string]AlertDetails),
+			lo:     lo,
+		}
+
+		alerts := []alertmgrtmpl.Alert{
+			{
+				Status:      "firing",
+				Fingerprint: "fingerprint-1",
+				Labels: alertmgrtmpl.KV{
+					"alertname": "PrometheusTargetTimeout",
+					"instance":  "prometheus-1",
+				},
+				StartsAt: time.Now(),
+			},
+			{
+				Status:      "firing",
+				Fingerprint: "fingerprint-2",
+				Labels: alertmgrtmpl.KV{
+					"alertname": "PrometheusTargetTimeout",
+					"instance":  "prometheus-2",
+				},
+				StartsAt: time.Now(),
+			},
+			{
+				Status:      "firing",
+				Fingerprint: "fingerprint-3",
+				Labels: alertmgrtmpl.KV{
+					"alertname": "PrometheusTargetTimeout",
+					"instance":  "prometheus-3",
+				},
+				StartsAt: time.Now(),
+			},
+		}
+
+		groups, err := aa.apply(alerts)
+		require.NoError(t, err)
+		require.Len(t, groups, 1)
+		assert.Equal(t, "PrometheusTargetTimeout", groups[0].TrackingKey)
+		assert.Equal(t, "firing", groups[0].Status)
+		assert.Equal(t, 3, groups[0].Count)
+		assert.Equal(t, 3, groups[0].FiringCount)
+		assert.Equal(t, 0, groups[0].ResolvedCount)
+
+		resolved := alerts[0]
+		resolved.Status = "resolved"
+		groups, err = aa.apply([]alertmgrtmpl.Alert{resolved})
+		require.NoError(t, err)
+		require.Len(t, groups, 1)
+		assert.Equal(t, "firing", groups[0].Status)
+		assert.Equal(t, 3, groups[0].Count)
+		assert.Equal(t, 2, groups[0].FiringCount)
+		assert.Equal(t, 1, groups[0].ResolvedCount)
+		assert.Equal(t, "resolved", groups[0].Alerts[0].Status)
+		assert.Equal(t, "firing", groups[0].Alerts[1].Status)
+		assert.Equal(t, "firing", groups[0].Alerts[2].Status)
+
+		remainingResolved := []alertmgrtmpl.Alert{alerts[1], alerts[2]}
+		remainingResolved[0].Status = "resolved"
+		remainingResolved[1].Status = "resolved"
+		groups, err = aa.apply(remainingResolved)
+		require.NoError(t, err)
+		require.Len(t, groups, 1)
+		assert.Equal(t, "resolved", groups[0].Status)
+		assert.Equal(t, 3, groups[0].Count)
+		assert.Equal(t, 0, groups[0].FiringCount)
+		assert.Equal(t, 3, groups[0].ResolvedCount)
+	})
+
+	t.Run("apply groups payload by alertname and preserves first seen group order", func(t *testing.T) {
+		aa := &ActiveAlerts{
+			alerts: make(map[string]AlertDetails),
+			lo:     lo,
+		}
+
+		groups, err := aa.apply([]alertmgrtmpl.Alert{
+			{
+				Status:      "firing",
+				Fingerprint: "cpu-1",
+				Labels: alertmgrtmpl.KV{
+					"alertname": "HighCPU",
+				},
+				StartsAt: time.Now(),
+			},
+			{
+				Status:      "firing",
+				Fingerprint: "disk-1",
+				Labels: alertmgrtmpl.KV{
+					"alertname": "DiskFull",
+				},
+				StartsAt: time.Now(),
+			},
+			{
+				Status:      "firing",
+				Fingerprint: "cpu-2",
+				Labels: alertmgrtmpl.KV{
+					"alertname": "HighCPU",
+				},
+				StartsAt: time.Now(),
+			},
+		})
+		require.NoError(t, err)
+		require.Len(t, groups, 2)
+		assert.Equal(t, "HighCPU", groups[0].TrackingKey)
+		assert.Equal(t, 2, groups[0].Count)
+		assert.Equal(t, "DiskFull", groups[1].TrackingKey)
+		assert.Equal(t, 1, groups[1].Count)
+	})
+
+	t.Run("apply falls back to fingerprint when alertname is missing or blank", func(t *testing.T) {
+		aa := &ActiveAlerts{
+			alerts: make(map[string]AlertDetails),
+			lo:     lo,
+		}
+
+		groups, err := aa.apply([]alertmgrtmpl.Alert{
+			{
+				Status:      "firing",
+				Fingerprint: "missing-label",
+				StartsAt:    time.Now(),
+			},
+			{
+				Status:      "firing",
+				Fingerprint: "blank-label",
+				Labels: alertmgrtmpl.KV{
+					"alertname": " ",
+				},
+				StartsAt: time.Now(),
+			},
+		})
+		require.NoError(t, err)
+		require.Len(t, groups, 2)
+		assert.Equal(t, "missing-label", groups[0].TrackingKey)
+		assert.Equal(t, "blank-label", groups[1].TrackingKey)
+		assert.NotEqual(t, groups[0].ThreadKey, groups[1].ThreadKey)
+	})
+
 	t.Run("lookup non-existent alert returns empty", func(t *testing.T) {
 		aa := &ActiveAlerts{
 			alerts: make(map[string]AlertDetails),
@@ -396,6 +555,147 @@ func TestGoogleChatManager(t *testing.T) {
 	})
 }
 
+func TestPushAggregatesMessagesByAlertname(t *testing.T) {
+	type chatRequest struct {
+		ThreadKey string
+		Text      string
+	}
+
+	var (
+		mu       sync.Mutex
+		requests []chatRequest
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Text string `json:"text"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+
+		mu.Lock()
+		requests = append(requests, chatRequest{
+			ThreadKey: r.URL.Query().Get("threadKey"),
+			Text:      payload.Text,
+		})
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	templatePath := filepath.Join(t.TempDir(), "message.tmpl")
+	templateContent := `{{ .AlertName }} count={{ .Count }} firing={{ .FiringCount }} resolved={{ .ResolvedCount }}{{ range .Alerts }} {{ .Labels.instance }}={{ .Status }}{{ end }}`
+	require.NoError(t, os.WriteFile(templatePath, []byte(templateContent), 0o600))
+
+	chat, err := NewGoogleChat(GoogleChatOpts{
+		Log:             slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		Metrics:         metrics.New("calert"),
+		Endpoint:        server.URL,
+		Room:            "test-room",
+		Template:        templatePath,
+		ThreadedReplies: true,
+	})
+	require.NoError(t, err)
+
+	alerts := []alertmgrtmpl.Alert{
+		{
+			Status:      "firing",
+			Fingerprint: "target-1",
+			Labels: alertmgrtmpl.KV{
+				"alertname": "PrometheusTargetTimeout",
+				"instance":  "prometheus-1",
+			},
+			StartsAt: time.Now(),
+		},
+		{
+			Status:      "firing",
+			Fingerprint: "target-2",
+			Labels: alertmgrtmpl.KV{
+				"alertname": "PrometheusTargetTimeout",
+				"instance":  "prometheus-2",
+			},
+			StartsAt: time.Now(),
+		},
+		{
+			Status:      "firing",
+			Fingerprint: "target-3",
+			Labels: alertmgrtmpl.KV{
+				"alertname": "PrometheusTargetTimeout",
+				"instance":  "prometheus-3",
+			},
+			StartsAt: time.Now(),
+		},
+	}
+
+	require.NoError(t, chat.Push(alerts))
+	require.Len(t, requests, 1)
+	assert.NotEmpty(t, requests[0].ThreadKey)
+	assert.Contains(t, requests[0].Text, "PrometheusTargetTimeout count=3 firing=3 resolved=0")
+	assert.Contains(t, requests[0].Text, "prometheus-1=firing")
+	assert.Contains(t, requests[0].Text, "prometheus-2=firing")
+	assert.Contains(t, requests[0].Text, "prometheus-3=firing")
+
+	resolved := alerts[0]
+	resolved.Status = "resolved"
+	require.NoError(t, chat.Push([]alertmgrtmpl.Alert{resolved}))
+	require.Len(t, requests, 2)
+	assert.Equal(t, requests[0].ThreadKey, requests[1].ThreadKey)
+	assert.Contains(t, requests[1].Text, "PrometheusTargetTimeout count=3 firing=2 resolved=1")
+	assert.Contains(t, requests[1].Text, "prometheus-1=resolved")
+	assert.Contains(t, requests[1].Text, "prometheus-2=firing")
+	assert.Contains(t, requests[1].Text, "prometheus-3=firing")
+}
+
+func TestPushSendsSeparateMessagesForSeparateAlertnames(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		assert.NotEmpty(t, r.URL.Query().Get("threadKey"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	templatePath := filepath.Join(t.TempDir(), "message.tmpl")
+	require.NoError(t, os.WriteFile(templatePath, []byte(`{{ .AlertName }} {{ .Count }}`), 0o600))
+
+	chat, err := NewGoogleChat(GoogleChatOpts{
+		Log:             slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		Metrics:         metrics.New("calert"),
+		Endpoint:        server.URL,
+		Room:            "test-room",
+		Template:        templatePath,
+		ThreadedReplies: true,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, chat.Push([]alertmgrtmpl.Alert{
+		{
+			Status:      "firing",
+			Fingerprint: "cpu-1",
+			Labels: alertmgrtmpl.KV{
+				"alertname": "HighCPU",
+			},
+			StartsAt: time.Now(),
+		},
+		{
+			Status:      "firing",
+			Fingerprint: "disk-1",
+			Labels: alertmgrtmpl.KV{
+				"alertname": "DiskFull",
+			},
+			StartsAt: time.Now(),
+		},
+		{
+			Status:      "firing",
+			Fingerprint: "cpu-2",
+			Labels: alertmgrtmpl.KV{
+				"alertname": "HighCPU",
+			},
+			StartsAt: time.Now(),
+		},
+	}))
+	assert.Equal(t, int32(2), atomic.LoadInt32(&requestCount))
+}
+
 func TestPrepareMessage(t *testing.T) {
 	opts := &GoogleChatOpts{
 		Log:      slog.New(slog.NewJSONHandler(os.Stdout, nil)),
@@ -420,7 +720,7 @@ func TestPrepareMessage(t *testing.T) {
 			},
 		}
 
-		msgs, err := chat.prepareMessage(alert)
+		msgs, err := chat.prepareMessage(testAlertGroup(alert))
 		require.NoError(t, err)
 		require.Len(t, msgs, 1)
 		assert.Contains(t, msgs[0].Text, "CRITICAL")
@@ -439,9 +739,75 @@ func TestPrepareMessage(t *testing.T) {
 			Annotations: alertmgrtmpl.KV{},
 		}
 
-		msgs, err := chat.prepareMessage(alert)
+		msgs, err := chat.prepareMessage(testAlertGroup(alert))
 		require.NoError(t, err)
 		require.Len(t, msgs, 1)
 		assert.Contains(t, msgs[0].Text, "WARNING")
+	})
+
+	t.Run("renders cardsV2 with grouped alerts", func(t *testing.T) {
+		templatePath := filepath.Join(t.TempDir(), "message.tmpl")
+		templateContent := `{{ define "cardsV2" }}{
+  "cardId": "alert-{{ .TrackingKey }}",
+  "card": {
+    "sections": [{
+      "widgets": [{
+        "textParagraph": {
+          "text": "{{ range .Alerts }}{{ .Labels.instance }}={{ .Status }} {{ end }}"
+        }
+      }]
+    }]
+  }
+}{{ end }}{{ .AlertName }} count={{ .Count }} firing={{ .FiringCount }} resolved={{ .ResolvedCount }}`
+		require.NoError(t, os.WriteFile(templatePath, []byte(templateContent), 0o600))
+
+		chat, err := NewGoogleChat(GoogleChatOpts{
+			Log:      slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+			Endpoint: "http://test",
+			Room:     "test",
+			Template: templatePath,
+		})
+		require.NoError(t, err)
+
+		alerts := []alertmgrtmpl.Alert{
+			{
+				Status:      "firing",
+				Fingerprint: "target-1",
+				Labels: alertmgrtmpl.KV{
+					"alertname": "PrometheusTargetTimeout",
+					"instance":  "prometheus-1",
+				},
+			},
+			{
+				Status:      "resolved",
+				Fingerprint: "target-2",
+				Labels: alertmgrtmpl.KV{
+					"alertname": "PrometheusTargetTimeout",
+					"instance":  "prometheus-2",
+				},
+			},
+		}
+		group := AlertGroup{
+			Alert:         alerts[0],
+			Alerts:        alerts,
+			Count:         2,
+			FiringCount:   1,
+			ResolvedCount: 1,
+			TrackingKey:   "PrometheusTargetTimeout",
+			AlertName:     "PrometheusTargetTimeout",
+			ThreadKey:     "thread-key",
+		}
+
+		msgs, err := chat.prepareMessage(group)
+		require.NoError(t, err)
+		require.Len(t, msgs, 1)
+		assert.Contains(t, msgs[0].Text, "PrometheusTargetTimeout count=2 firing=1 resolved=1")
+		require.Len(t, msgs[0].CardsV2, 1)
+		require.NotNil(t, msgs[0].CardsV2[0].Card)
+		require.Len(t, msgs[0].CardsV2[0].Card.Sections, 1)
+		widgets := msgs[0].CardsV2[0].Card.Sections[0].Widgets
+		require.Len(t, widgets, 1)
+		assert.Contains(t, widgets[0].TextParagraph.Text, "prometheus-1=firing")
+		assert.Contains(t, widgets[0].TextParagraph.Text, "prometheus-2=resolved")
 	})
 }
