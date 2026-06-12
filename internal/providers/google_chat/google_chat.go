@@ -14,6 +14,7 @@ import (
 
 	retryablehttp "github.com/hashicorp/go-retryablehttp"
 	"github.com/mr-karan/calert/internal/metrics"
+	"github.com/mr-karan/calert/internal/providers"
 	alertmgrtmpl "github.com/prometheus/alertmanager/template"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -29,7 +30,21 @@ type GoogleChatManager struct {
 	msgTmpl         *template.Template
 	dryRun          bool
 	threadedReplies bool
+	threadingMode   string
+	threadTTL       time.Duration
+	dedupWindow     time.Duration
+	maxAlertsPerMsg int
+	groupStates     *groupStates
 }
+
+const (
+	// ThreadingModeAlert is the legacy behaviour: one thread per alert
+	// fingerprint, keyed by a random UUID held in memory.
+	ThreadingModeAlert = "alert"
+	// ThreadingModeGroup threads by Alertmanager group: one aggregated
+	// message per webhook payload, posted into a deterministic thread.
+	ThreadingModeGroup = "group"
+)
 
 type GoogleChatOpts struct {
 	Log             *slog.Logger
@@ -43,6 +58,9 @@ type GoogleChatOpts struct {
 	Template        string
 	ThreadTTL       time.Duration
 	ThreadedReplies bool
+	ThreadingMode   string
+	DedupWindow     time.Duration
+	MaxAlertsPerMsg int
 	RetryMax        int
 	RetryWaitMin    time.Duration
 	RetryWaitMax    time.Duration
@@ -176,15 +194,91 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 		msgTmpl:         tmpl,
 		dryRun:          opts.DryRun,
 		threadedReplies: opts.ThreadedReplies,
+		threadingMode:   opts.ThreadingMode,
+		threadTTL:       opts.ThreadTTL,
+		dedupWindow:     opts.DedupWindow,
+		maxAlertsPerMsg: opts.MaxAlertsPerMsg,
+		groupStates:     newGroupStates(opts.Log),
+	}
+	if mgr.threadingMode == "" {
+		mgr.threadingMode = ThreadingModeAlert
+	}
+	if mgr.threadTTL <= 0 {
+		mgr.threadTTL = 12 * time.Hour
+	}
+	if mgr.threadingMode != ThreadingModeAlert && mgr.threadingMode != ThreadingModeGroup {
+		return nil, fmt.Errorf("invalid threading_mode %q: must be %q or %q", mgr.threadingMode, ThreadingModeAlert, ThreadingModeGroup)
 	}
 	// Start a background worker to cleanup alerts based on TTL mechanism.
 	go mgr.activeAlerts.startPruneWorker(1*time.Hour, opts.ThreadTTL)
+	// Backstop pruner for group-mode state, for groups that never report a
+	// fully-resolved payload.
+	go mgr.groupStates.startPruneWorker(1*time.Hour, opts.ThreadTTL)
 
 	return mgr, nil
 }
 
-// Push accepts the list of alerts and dispatches them to Webhook API endpoint.
-func (m *GoogleChatManager) Push(alerts []alertmgrtmpl.Alert) error {
+// Push accepts an Alertmanager webhook payload and dispatches notifications
+// to the Webhook API endpoint, threading either per alert (legacy) or per
+// group depending on the configured threading mode.
+func (m *GoogleChatManager) Push(payload providers.WebhookPayload) error {
+	if m.threadingMode == ThreadingModeGroup {
+		return m.pushGroup(payload)
+	}
+	return m.pushAlerts(payload.Alerts)
+}
+
+// pushGroup posts one aggregated message per webhook payload into the
+// group's deterministic thread.
+func (m *GoogleChatManager) pushGroup(payload providers.WebhookPayload) error {
+	var (
+		now       = time.Now()
+		threadKey = threadKeyForGroup(payload.GroupKey, now, m.threadTTL)
+		hash      = stateHash(payload.Alerts)
+	)
+
+	m.lo.Info("dispatching group notification to google chat", "group_key", payload.GroupKey, "count", len(payload.Alerts))
+	m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_total{provider="%s", room="%s"}`, m.ID(), m.Room()))
+
+	// Drop cluster-race duplicates: same alert states, posted moments ago.
+	if !m.groupStates.shouldPost(payload.GroupKey, hash, now, m.dedupWindow) {
+		m.lo.Debug("suppressing duplicate group notification", "group_key", payload.GroupKey, "state_hash", hash)
+		m.metrics.Increment(fmt.Sprintf(`alerts_deduplicated_total{provider="%s", room="%s"}`, m.ID(), m.Room()))
+		return nil
+	}
+
+	tmplCtx := buildGroupContext(payload, threadKey, m.maxAlertsPerMsg)
+
+	msgs, err := m.prepareMessage(tmplCtx)
+	if err != nil {
+		m.lo.Error("error preparing group message", "error", err)
+		m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="preparing"}`, m.ID(), m.Room()))
+		return err
+	}
+
+	for _, msg := range msgs {
+		if m.dryRun {
+			m.lo.Info("dry_run is enabled for this room. skipping pushing notification", "room", m.Room())
+			continue
+		}
+		if err := m.sendMessage(msg, threadKey, true); err != nil {
+			m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="sending"}`, m.ID(), m.Room()))
+			m.lo.Error("error sending group message", "error", err)
+			return err
+		}
+	}
+	m.metrics.Duration(fmt.Sprintf(`alerts_dispatched_duration_seconds{provider="%s", room="%s"}`, m.ID(), m.Room()), now)
+
+	// All instances resolved: the incident is over, forget the group.
+	if tmplCtx.FiringCount == 0 {
+		m.groupStates.delete(payload.GroupKey)
+	}
+
+	return nil
+}
+
+// pushAlerts is the legacy per-alert dispatch path.
+func (m *GoogleChatManager) pushAlerts(alerts []alertmgrtmpl.Alert) error {
 	m.lo.Info("dispatching alerts to google chat", "count", len(alerts))
 
 	// For each alert, lookup the UUID and send the alert.
@@ -214,7 +308,7 @@ func (m *GoogleChatManager) Push(alerts []alertmgrtmpl.Alert) error {
 			if m.dryRun {
 				m.lo.Info("dry_run is enabled for this room. skipping pushing notification", "room", m.Room())
 			} else {
-				if err := m.sendMessage(msg, threadKey); err != nil {
+				if err := m.sendMessage(msg, threadKey, m.threadedReplies); err != nil {
 					m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="sending"}`, m.ID(), m.Room()))
 					m.lo.Error("error sending message", "error", err)
 					continue
