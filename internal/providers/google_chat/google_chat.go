@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -24,26 +25,30 @@ type GoogleChatManager struct {
 	lo              *slog.Logger
 	metrics         *metrics.Manager
 	activeAlerts    *ActiveAlerts
+	pendingMu       sync.Mutex
+	pendingAlerts   map[string]*pendingAlertBatch
 	endpoint        string
 	room            string
 	client          *retryablehttp.Client
 	msgTmpl         *template.Template
 	dryRun          bool
 	threadedReplies bool
+	groupWait       time.Duration
 }
 
 type GoogleChatOpts struct {
-	Log             *slog.Logger
-	Metrics         *metrics.Manager
-	DryRun          bool
-	MaxIdleConn     int
-	Timeout         time.Duration
-	ProxyURL        string
-	Endpoint        string
-	Room            string
-	Template        string
-	ThreadTTL       time.Duration
-	ThreadedReplies bool
+	Log                   *slog.Logger
+	Metrics               *metrics.Manager
+	DryRun                bool
+	MaxIdleConn           int
+	Timeout               time.Duration
+	ProxyURL              string
+	Endpoint              string
+	Room                  string
+	Template              string
+	ThreadTTL             time.Duration
+	ThreadedReplies       bool
+	NotificationGroupWait time.Duration
 	// ThreadAnchorHourUTC is the UTC hour (0-23) at which the daily thread
 	// rotation happens. Pick the quietest hour to minimise threads split
 	// across the boundary.
@@ -51,6 +56,11 @@ type GoogleChatOpts struct {
 	RetryMax            int
 	RetryWaitMin        time.Duration
 	RetryWaitMax        time.Duration
+}
+
+type pendingAlertBatch struct {
+	alerts []alertmgrtmpl.Alert
+	timer  *time.Timer
 }
 
 // NewGoogleChat initializes a Google Chat provider object.
@@ -191,9 +201,11 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 			metrics:       opts.Metrics,
 			anchorHourUTC: opts.ThreadAnchorHourUTC,
 		},
+		pendingAlerts:   make(map[string]*pendingAlertBatch),
 		msgTmpl:         tmpl,
 		dryRun:          opts.DryRun,
 		threadedReplies: opts.ThreadedReplies,
+		groupWait:       opts.NotificationGroupWait,
 	}
 	// Start a background worker to cleanup alerts based on TTL mechanism.
 	go mgr.activeAlerts.startPruneWorker(1*time.Hour, opts.ThreadTTL)
@@ -205,6 +217,59 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 func (m *GoogleChatManager) Push(alerts []alertmgrtmpl.Alert) error {
 	m.lo.Info("dispatching alerts to google chat", "count", len(alerts))
 
+	if m.groupWait > 0 {
+		m.enqueue(alerts)
+		return nil
+	}
+
+	return m.dispatch(alerts)
+}
+
+func (m *GoogleChatManager) enqueue(alerts []alertmgrtmpl.Alert) {
+	groupOrder := groupAlerts(alerts)
+	groupedAlerts := make(map[string][]alertmgrtmpl.Alert, len(groupOrder))
+	for _, alert := range alerts {
+		key := trackingKey(alert)
+		groupedAlerts[key] = append(groupedAlerts[key], alert)
+	}
+
+	m.pendingMu.Lock()
+	defer m.pendingMu.Unlock()
+
+	for _, key := range groupOrder {
+		batch, ok := m.pendingAlerts[key]
+		if !ok {
+			batch = &pendingAlertBatch{}
+			m.pendingAlerts[key] = batch
+		}
+
+		batch.alerts = append(batch.alerts, groupedAlerts[key]...)
+		if batch.timer == nil {
+			trackingKey := key
+			batch.timer = time.AfterFunc(m.groupWait, func() {
+				m.flush(trackingKey)
+			})
+		}
+	}
+}
+
+func (m *GoogleChatManager) flush(trackingKey string) {
+	m.pendingMu.Lock()
+	batch, ok := m.pendingAlerts[trackingKey]
+	if !ok {
+		m.pendingMu.Unlock()
+		return
+	}
+	delete(m.pendingAlerts, trackingKey)
+	alerts := append([]alertmgrtmpl.Alert(nil), batch.alerts...)
+	m.pendingMu.Unlock()
+
+	if err := m.dispatch(alerts); err != nil {
+		m.lo.Error("error dispatching buffered google chat alerts", "tracking_key", trackingKey, "error", err)
+	}
+}
+
+func (m *GoogleChatManager) dispatch(alerts []alertmgrtmpl.Alert) error {
 	groups, err := m.activeAlerts.apply(alerts)
 	if err != nil {
 		m.lo.Error("error preparing google chat alert groups", "error", err)

@@ -661,6 +661,87 @@ func TestPushAggregatesMessagesByAlertname(t *testing.T) {
 	assert.Contains(t, requests[1].Text, "prometheus-3=firing")
 }
 
+func TestPushCoalescesNearSimultaneousNotificationsByAlertname(t *testing.T) {
+	type chatRequest struct {
+		ThreadKey string
+		Text      string
+	}
+
+	var (
+		mu       sync.Mutex
+		requests []chatRequest
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Text string `json:"text"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+
+		mu.Lock()
+		requests = append(requests, chatRequest{
+			ThreadKey: r.URL.Query().Get("threadKey"),
+			Text:      payload.Text,
+		})
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	templatePath := filepath.Join(t.TempDir(), "message.tmpl")
+	templateContent := `{{ .AlertName }} count={{ .Count }} firing={{ .FiringCount }} resolved={{ .ResolvedCount }}{{ range .Alerts }} {{ .Labels.instance }}={{ .Status }}{{ end }}`
+	require.NoError(t, os.WriteFile(templatePath, []byte(templateContent), 0o600))
+
+	chat, err := NewGoogleChat(GoogleChatOpts{
+		Log:                   slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		Metrics:               metrics.New("calert"),
+		Endpoint:              server.URL,
+		Room:                  "test-room",
+		Template:              templatePath,
+		ThreadedReplies:       true,
+		NotificationGroupWait: 20 * time.Millisecond,
+	})
+	require.NoError(t, err)
+
+	first := alertmgrtmpl.Alert{
+		Status:      "firing",
+		Fingerprint: "target-1",
+		Labels: alertmgrtmpl.KV{
+			"alertname": "PrometheusTargetTimeout",
+			"instance":  "prometheus-1",
+		},
+		StartsAt: time.Now(),
+	}
+	second := alertmgrtmpl.Alert{
+		Status:      "firing",
+		Fingerprint: "target-2",
+		Labels: alertmgrtmpl.KV{
+			"alertname": "PrometheusTargetTimeout",
+			"instance":  "prometheus-2",
+		},
+		StartsAt: time.Now(),
+	}
+
+	require.NoError(t, chat.Push([]alertmgrtmpl.Alert{first}))
+	require.NoError(t, chat.Push([]alertmgrtmpl.Alert{second}))
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(requests) == 1
+	}, time.Second, 10*time.Millisecond)
+
+	mu.Lock()
+	got := requests[0]
+	mu.Unlock()
+
+	assert.NotEmpty(t, got.ThreadKey)
+	assert.Contains(t, got.Text, "PrometheusTargetTimeout count=2 firing=2 resolved=0")
+	assert.Contains(t, got.Text, "prometheus-1=firing")
+	assert.Contains(t, got.Text, "prometheus-2=firing")
+}
+
 func TestPushSendsSeparateMessagesForSeparateAlertnames(t *testing.T) {
 	var requestCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

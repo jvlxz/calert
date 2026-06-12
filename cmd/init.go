@@ -86,17 +86,18 @@ func initConfig(cfgDefault string, envPrefix string) (*koanf.Koanf, error) {
 func initProviders(ko *koanf.Koanf, lo *slog.Logger, metrics *metrics.Manager) ([]prvs.Provider, error) {
 	provs := make([]prvs.Provider, 0)
 	provDefOpts := map[string]interface{}{
-		"type":                   "google_chat",
-		"max_idle_conns":         50,
-		"timeout":                "30s",
-		"template":               "static/message.tmpl",
-		"thread_ttl":             "12h",
-		"threaded_replies":       false,
-		"thread_anchor_hour_utc": 4,
-		"dry_run":                false,
-		"retry_max":              3,
-		"retry_wait_min":         "1s",
-		"retry_wait_max":         "5s",
+		"type":                    "google_chat",
+		"max_idle_conns":          50,
+		"timeout":                 "30s",
+		"template":                "static/message.tmpl",
+		"thread_ttl":              "12h",
+		"threaded_replies":        false,
+		"thread_anchor_hour_utc":  4,
+		"notification_group_wait": "2s",
+		"dry_run":                 false,
+		"retry_max":               3,
+		"retry_wait_min":          "1s",
+		"retry_wait_max":          "5s",
 	}
 
 	// Loop over all providers listed in config.
@@ -114,21 +115,22 @@ func initProviders(ko *koanf.Koanf, lo *slog.Logger, metrics *metrics.Manager) (
 		switch provType {
 		case "google_chat":
 			opts := google_chat.GoogleChatOpts{
-				Log:                 lo,
-				Timeout:             ko.MustDuration(fmt.Sprintf("%s.timeout", cfgKey)),
-				MaxIdleConn:         ko.MustInt(fmt.Sprintf("%s.max_idle_conns", cfgKey)),
-				ProxyURL:            ko.String(fmt.Sprintf("%s.proxy_url", cfgKey)),
-				Endpoint:            ko.MustString(fmt.Sprintf("%s.endpoint", cfgKey)),
-				Room:                name,
-				Template:            ko.MustString(fmt.Sprintf("%s.template", cfgKey)),
-				ThreadTTL:           ko.MustDuration(fmt.Sprintf("%s.thread_ttl", cfgKey)),
-				ThreadedReplies:     ko.Bool(fmt.Sprintf("%s.threaded_replies", cfgKey)),
-				ThreadAnchorHourUTC: ko.Int(fmt.Sprintf("%s.thread_anchor_hour_utc", cfgKey)),
-				Metrics:             metrics,
-				DryRun:              ko.Bool(fmt.Sprintf("%s.dry_run", cfgKey)),
-				RetryMax:            ko.Int(fmt.Sprintf("%s.retry_max", cfgKey)),
-				RetryWaitMin:        ko.Duration(fmt.Sprintf("%s.retry_wait_min", cfgKey)),
-				RetryWaitMax:        ko.Duration(fmt.Sprintf("%s.retry_wait_max", cfgKey)),
+				Log:                   lo,
+				Timeout:               ko.MustDuration(fmt.Sprintf("%s.timeout", cfgKey)),
+				MaxIdleConn:           ko.MustInt(fmt.Sprintf("%s.max_idle_conns", cfgKey)),
+				ProxyURL:              ko.String(fmt.Sprintf("%s.proxy_url", cfgKey)),
+				Endpoint:              ko.MustString(fmt.Sprintf("%s.endpoint", cfgKey)),
+				Room:                  name,
+				Template:              ko.MustString(fmt.Sprintf("%s.template", cfgKey)),
+				ThreadTTL:             ko.MustDuration(fmt.Sprintf("%s.thread_ttl", cfgKey)),
+				ThreadedReplies:       ko.Bool(fmt.Sprintf("%s.threaded_replies", cfgKey)),
+				NotificationGroupWait: ko.MustDuration(fmt.Sprintf("%s.notification_group_wait", cfgKey)),
+				ThreadAnchorHourUTC:   ko.Int(fmt.Sprintf("%s.thread_anchor_hour_utc", cfgKey)),
+				Metrics:               metrics,
+				DryRun:                ko.Bool(fmt.Sprintf("%s.dry_run", cfgKey)),
+				RetryMax:              ko.Int(fmt.Sprintf("%s.retry_max", cfgKey)),
+				RetryWaitMin:          ko.Duration(fmt.Sprintf("%s.retry_wait_min", cfgKey)),
+				RetryWaitMax:          ko.Duration(fmt.Sprintf("%s.retry_wait_max", cfgKey)),
 			}
 			lo.Debug("provider options", "type", provType, "options", opts)
 

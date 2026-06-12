@@ -88,6 +88,7 @@ Example:
 |  `providers.<room_name>.proxy_url` 	| Specify `proxy_url` as your proxy endpoint to route all HTTP requests to the provider via a proxy. | no | - |
 |  `providers.<room_name>.threaded_replies` 	| Whether to send threaded replies or not. | no | false |
 |  `providers.<room_name>.thread_anchor_hour_utc` 	| UTC hour (0-23) at which a new thread starts each day per alert name. Pick your quietest hour to minimise incidents split across the daily rotation. | no | `4` |
+|  `providers.<room_name>.notification_group_wait` 	| Short delay to coalesce near-simultaneous notifications with the same tracking key into one rendered message. Set `0s` to send immediately. | no | `2s` |
 |  `providers.<room_name>.dry_run` 	| In case you're simply experimenting with `calert` config changes and you don't wish to send _actual_ notifications, you can set true. | no | false |
 |  `providers.<room_name>.retry_max` 	| Maximum number of retries | no | `3` |
 |  `providers.<room_name>.retry_wait_min` 	| Minimum time to wait before retrying | no | `1s` |
