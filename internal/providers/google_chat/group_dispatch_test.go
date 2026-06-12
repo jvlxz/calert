@@ -1,6 +1,7 @@
 package google_chat
 
 import (
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -18,13 +19,16 @@ type capturingServer struct {
 	*httptest.Server
 	mu         sync.Mutex
 	threadKeys []string
+	bodies     []string
 }
 
 func newCapturingServer() *capturingServer {
 	cs := &capturingServer{}
 	cs.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
 		cs.mu.Lock()
 		cs.threadKeys = append(cs.threadKeys, r.URL.Query().Get("threadKey"))
+		cs.bodies = append(cs.bodies, string(body))
 		cs.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{}`))
@@ -36,6 +40,15 @@ func (cs *capturingServer) keys() []string {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	return append([]string(nil), cs.threadKeys...)
+}
+
+func (cs *capturingServer) lastBody() string {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if len(cs.bodies) == 0 {
+		return ""
+	}
+	return cs.bodies[len(cs.bodies)-1]
 }
 
 func newGroupModeChat(t *testing.T, endpoint string) *GoogleChatManager {
@@ -117,4 +130,33 @@ func TestGroupModeDispatch(t *testing.T) {
 
 		assert.Len(t, srv.keys(), 3)
 	})
+}
+
+func TestGroupModeShowsResolvedOnlyOnce(t *testing.T) {
+	srv := newCapturingServer()
+	defer srv.Close()
+	chat := newGroupModeChat(t, srv.URL)
+
+	// node2 resolves: its transition is rendered.
+	require.NoError(t, chat.Push(groupPayload(
+		groupAlert("a", "firing", "node1"),
+		groupAlert("b", "firing", "node2"),
+	)))
+	require.NoError(t, chat.Push(groupPayload(
+		groupAlert("a", "firing", "node1"),
+		groupAlert("b", "resolved", "node2"),
+	)))
+	assert.Contains(t, srv.lastBody(), "node2")
+
+	// node1 resolves next: node2 was already shown as resolved and must
+	// not reappear, but it still counts in the header.
+	require.NoError(t, chat.Push(groupPayload(
+		groupAlert("a", "resolved", "node1"),
+		groupAlert("b", "resolved", "node2"),
+	)))
+	body := srv.lastBody()
+	assert.Contains(t, body, "node1")
+	assert.NotContains(t, body, "node2")
+	assert.Contains(t, body, "0 firing / 2 resolved")
+	assert.Len(t, srv.keys(), 3)
 }

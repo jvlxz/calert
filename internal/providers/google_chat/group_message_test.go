@@ -54,7 +54,7 @@ func TestBuildGroupContext(t *testing.T) {
 			groupAlert("a", "firing", "node1"),
 			groupAlert("b", "resolved", "node2"),
 			groupAlert("c", "firing", "node3"),
-		), "tk", 10)
+		), "tk", 10, nil)
 
 		assert.Equal(t, 2, ctx.FiringCount)
 		assert.Equal(t, 1, ctx.ResolvedCount)
@@ -68,7 +68,7 @@ func TestBuildGroupContext(t *testing.T) {
 			groupAlert("a", "resolved", "node1"),
 			groupAlert("b", "firing", "node2"),
 			groupAlert("c", "resolved", "node3"),
-		), "tk", 10)
+		), "tk", 10, nil)
 
 		require.Len(t, ctx.Alerts, 3)
 		assert.Equal(t, "firing", ctx.Alerts[0].Status)
@@ -86,7 +86,7 @@ func TestBuildGroupContext(t *testing.T) {
 			alerts = append(alerts, groupAlert(fmt.Sprintf("r%d", i), "resolved", fmt.Sprintf("nodeR%d", i)))
 		}
 
-		ctx := buildGroupContext(groupPayload(alerts...), "tk", 10)
+		ctx := buildGroupContext(groupPayload(alerts...), "tk", 10, nil)
 
 		assert.Len(t, ctx.Alerts, 10)
 		assert.Equal(t, 5, ctx.Overflow.Count)
@@ -98,7 +98,7 @@ func TestBuildGroupContext(t *testing.T) {
 	})
 
 	t.Run("no overflow when under the cap", func(t *testing.T) {
-		ctx := buildGroupContext(groupPayload(groupAlert("a", "firing", "node1")), "tk", 10)
+		ctx := buildGroupContext(groupPayload(groupAlert("a", "firing", "node1")), "tk", 10, nil)
 		assert.Len(t, ctx.Alerts, 1)
 		assert.Equal(t, 0, ctx.Overflow.Count)
 	})
@@ -110,7 +110,7 @@ func TestBuildGroupContext(t *testing.T) {
 		)
 		delete(payload.CommonLabels, "severity")
 
-		ctx := buildGroupContext(payload, "tk", 10)
+		ctx := buildGroupContext(payload, "tk", 10, nil)
 		assert.Equal(t, "warning", ctx.Labels["severity"])
 		// The payload itself is not mutated.
 		_, ok := payload.CommonLabels["severity"]
@@ -121,7 +121,7 @@ func TestBuildGroupContext(t *testing.T) {
 		ctx := buildGroupContext(groupPayload(
 			groupAlert("a", "resolved", "node1"),
 			groupAlert("b", "firing", "node2"),
-		), "tk", 10)
+		), "tk", 10, nil)
 
 		// First alert after firing-first ordering is "b".
 		assert.Equal(t, "https://prometheus.example.com/graph", ctx.GeneratorURL)
@@ -143,7 +143,7 @@ func TestGroupTemplateRendersValidCardsV2(t *testing.T) {
 	for i := 0; i < 12; i++ {
 		alerts = append(alerts, groupAlert(fmt.Sprintf("f%d", i), "firing", fmt.Sprintf("node%d", i)))
 	}
-	ctx := buildGroupContext(groupPayload(alerts...), "thread-key-123", 10)
+	ctx := buildGroupContext(groupPayload(alerts...), "thread-key-123", 10, nil)
 
 	msgs, err := chat.prepareMessage(ctx)
 	require.NoError(t, err)
@@ -159,4 +159,36 @@ func TestGroupTemplateRendersValidCardsV2(t *testing.T) {
 	assert.Contains(t, s, "and 2 more instances (2 firing / 0 resolved)")
 	assert.Contains(t, s, "Prometheus")
 	assert.Contains(t, msgs[0].Text, "PrometheusTargetMissing")
+}
+
+func TestBuildGroupContextHidesAlreadyShownResolved(t *testing.T) {
+	// Scenario from the field: node2 resolved and was shown as resolved in
+	// the previous message; gitlab1 resolves next. The new message must
+	// render gitlab1's transition but not re-show node2, while counters
+	// keep covering the full payload.
+	payload := groupPayload(
+		groupAlert("a", "firing", "node1"),
+		groupAlert("b", "resolved", "node2"),
+		groupAlert("c", "resolved", "gitlab1"),
+	)
+	prev := map[string]string{"a": "firing", "b": "resolved", "c": "firing"}
+
+	ctx := buildGroupContext(payload, "tk", 10, prev)
+
+	require.Len(t, ctx.Alerts, 2)
+	assert.Equal(t, "a", ctx.Alerts[0].Fingerprint)
+	assert.Equal(t, "c", ctx.Alerts[1].Fingerprint)
+	// Hidden instances still count in the header.
+	assert.Equal(t, 1, ctx.FiringCount)
+	assert.Equal(t, 2, ctx.ResolvedCount)
+
+	t.Run("unknown previous status is rendered", func(t *testing.T) {
+		ctx := buildGroupContext(payload, "tk", 10, map[string]string{"a": "firing"})
+		assert.Len(t, ctx.Alerts, 3)
+	})
+
+	t.Run("nil previous statuses renders everything", func(t *testing.T) {
+		ctx := buildGroupContext(payload, "tk", 10, nil)
+		assert.Len(t, ctx.Alerts, 3)
+	})
 }

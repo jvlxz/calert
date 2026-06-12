@@ -241,13 +241,14 @@ func (m *GoogleChatManager) pushGroup(payload providers.WebhookPayload) error {
 	m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_total{provider="%s", room="%s"}`, m.ID(), m.Room()))
 
 	// Drop cluster-race duplicates: same alert states, posted moments ago.
-	if !m.groupStates.shouldPost(payload.GroupKey, hash, now, m.dedupWindow) {
+	prevStatuses, post := m.groupStates.shouldPost(payload.GroupKey, hash, statusesOf(payload.Alerts), now, m.dedupWindow)
+	if !post {
 		m.lo.Debug("suppressing duplicate group notification", "group_key", payload.GroupKey, "state_hash", hash)
 		m.metrics.Increment(fmt.Sprintf(`alerts_deduplicated_total{provider="%s", room="%s"}`, m.ID(), m.Room()))
 		return nil
 	}
 
-	tmplCtx := buildGroupContext(payload, threadKey, m.maxAlertsPerMsg)
+	tmplCtx := buildGroupContext(payload, threadKey, m.maxAlertsPerMsg, prevStatuses)
 
 	msgs, err := m.prepareMessage(tmplCtx)
 	if err != nil {

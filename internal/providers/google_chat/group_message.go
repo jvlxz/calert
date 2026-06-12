@@ -36,7 +36,13 @@ type GroupTemplateContext struct {
 // maxAlerts rendered entries, severity fallback to the first alert when it is
 // not common to the whole group, and first-alert conveniences where no
 // group-level equivalent exists.
-func buildGroupContext(payload providers.WebhookPayload, trackingKey string, maxAlerts int) GroupTemplateContext {
+//
+// prevStatuses holds the fingerprint → status pairs of the previously posted
+// message for this group (nil when unknown). A resolved instance is rendered
+// only on its firing → resolved transition: once shown as resolved, it is
+// dropped from later messages' sections. Header counters always cover the
+// full payload, so hidden instances still count as resolved.
+func buildGroupContext(payload providers.WebhookPayload, trackingKey string, maxAlerts int, prevStatuses map[string]string) GroupTemplateContext {
 	ctx := GroupTemplateContext{
 		AlertName:   payload.GroupLabels["alertname"],
 		Status:      payload.Status,
@@ -57,8 +63,15 @@ func buildGroupContext(payload providers.WebhookPayload, trackingKey string, max
 		ctx.Labels[k] = v
 	}
 
-	alerts := make([]alertmgrtmpl.Alert, len(payload.Alerts))
-	copy(alerts, payload.Alerts)
+	// Render firing alerts always; render a resolved alert only if the
+	// last posted message did not already show it as resolved.
+	alerts := make([]alertmgrtmpl.Alert, 0, len(payload.Alerts))
+	for _, a := range payload.Alerts {
+		if a.Status != "firing" && prevStatuses[a.Fingerprint] == "resolved" {
+			continue
+		}
+		alerts = append(alerts, a)
+	}
 	sort.SliceStable(alerts, func(i, j int) bool {
 		return alerts[i].Status == "firing" && alerts[j].Status != "firing"
 	})

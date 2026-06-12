@@ -41,6 +41,19 @@ func stateHash(alerts []alertmgrtmpl.Alert) string {
 type groupState struct {
 	lastHash string
 	lastPost time.Time
+	// lastStatuses records the fingerprint → status pairs of the last
+	// posted payload, so an instance already shown as resolved can be
+	// omitted from subsequent messages.
+	lastStatuses map[string]string
+}
+
+// statusesOf extracts the fingerprint → status pairs of a payload.
+func statusesOf(alerts []alertmgrtmpl.Alert) map[string]string {
+	statuses := make(map[string]string, len(alerts))
+	for _, a := range alerts {
+		statuses[a.Fingerprint] = a.Status
+	}
+	return statuses
 }
 
 // groupStates tracks per-group posting state, in memory only. Losing it on
@@ -61,17 +74,20 @@ func newGroupStates(lo *slog.Logger) *groupStates {
 // shouldPost decides whether a payload with the given state hash must be
 // posted. It returns false only for a cluster-race duplicate: an identical
 // hash arriving within the dedup window of the last post. When it returns
-// true, the new state is recorded.
-func (g *groupStates) shouldPost(groupKey, hash string, now time.Time, window time.Duration) bool {
+// true, the new state (hash and fingerprint → status pairs) is recorded and
+// the *previous* statuses are returned, so the caller can omit instances
+// already shown as resolved.
+func (g *groupStates) shouldPost(groupKey, hash string, statuses map[string]string, now time.Time, window time.Duration) (map[string]string, bool) {
 	g.Lock()
 	defer g.Unlock()
 
-	if st, ok := g.groups[groupKey]; ok && st.lastHash == hash && now.Sub(st.lastPost) < window {
-		return false
+	st, ok := g.groups[groupKey]
+	if ok && st.lastHash == hash && now.Sub(st.lastPost) < window {
+		return nil, false
 	}
 
-	g.groups[groupKey] = groupState{lastHash: hash, lastPost: now}
-	return true
+	g.groups[groupKey] = groupState{lastHash: hash, lastPost: now, lastStatuses: statuses}
+	return st.lastStatuses, true
 }
 
 // delete removes a group's state, called when all of its alerts resolved.

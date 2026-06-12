@@ -85,43 +85,82 @@ func TestGroupStatesDedup(t *testing.T) {
 		window = 5 * time.Minute
 	)
 
+	// post reduces shouldPost to its dedup decision for tests that don't
+	// care about the previous statuses.
+	post := func(g *groupStates, key, hash string, ts time.Time) bool {
+		_, ok := g.shouldPost(key, hash, nil, ts, window)
+		return ok
+	}
+
 	t.Run("suppresses identical hash within window", func(t *testing.T) {
 		g := newGroupStates(lo)
-		assert.True(t, g.shouldPost("g1", "h1", now, window))
-		assert.False(t, g.shouldPost("g1", "h1", now.Add(time.Minute), window))
+		assert.True(t, post(g, "g1", "h1", now))
+		assert.False(t, post(g, "g1", "h1", now.Add(time.Minute)))
 	})
 
 	t.Run("allows identical hash after window", func(t *testing.T) {
 		g := newGroupStates(lo)
-		assert.True(t, g.shouldPost("g1", "h1", now, window))
-		assert.True(t, g.shouldPost("g1", "h1", now.Add(window), window))
+		assert.True(t, post(g, "g1", "h1", now))
+		assert.True(t, post(g, "g1", "h1", now.Add(window)))
 	})
 
 	t.Run("allows different hash within window", func(t *testing.T) {
 		g := newGroupStates(lo)
-		assert.True(t, g.shouldPost("g1", "h1", now, window))
-		assert.True(t, g.shouldPost("g1", "h2", now.Add(time.Second), window))
+		assert.True(t, post(g, "g1", "h1", now))
+		assert.True(t, post(g, "g1", "h2", now.Add(time.Second)))
 	})
 
 	t.Run("groups are independent", func(t *testing.T) {
 		g := newGroupStates(lo)
-		assert.True(t, g.shouldPost("g1", "h1", now, window))
-		assert.True(t, g.shouldPost("g2", "h1", now, window))
+		assert.True(t, post(g, "g1", "h1", now))
+		assert.True(t, post(g, "g2", "h1", now))
 	})
 
 	t.Run("delete resets the dedup state", func(t *testing.T) {
 		g := newGroupStates(lo)
-		assert.True(t, g.shouldPost("g1", "h1", now, window))
+		assert.True(t, post(g, "g1", "h1", now))
 		g.delete("g1")
-		assert.True(t, g.shouldPost("g1", "h1", now.Add(time.Second), window))
+		assert.True(t, post(g, "g1", "h1", now.Add(time.Second)))
 	})
 
 	t.Run("prune removes stale groups only", func(t *testing.T) {
 		g := newGroupStates(lo)
-		g.shouldPost("stale", "h1", now.Add(-13*time.Hour), window)
-		g.shouldPost("fresh", "h1", now, window)
+		post(g, "stale", "h1", now.Add(-13*time.Hour))
+		post(g, "fresh", "h1", now)
 		g.prune(now, 12*time.Hour)
-		assert.False(t, g.shouldPost("fresh", "h1", now.Add(time.Second), window))
-		assert.True(t, g.shouldPost("stale", "h1", now.Add(time.Second), window))
+		assert.False(t, post(g, "fresh", "h1", now.Add(time.Second)))
+		assert.True(t, post(g, "stale", "h1", now.Add(time.Second)))
+	})
+}
+
+func TestGroupStatesPreviousStatuses(t *testing.T) {
+	var (
+		lo     = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+		now    = time.Now()
+		window = 5 * time.Minute
+	)
+
+	t.Run("first post has no previous statuses", func(t *testing.T) {
+		g := newGroupStates(lo)
+		prev, ok := g.shouldPost("g1", "h1", map[string]string{"a": "firing"}, now, window)
+		assert.True(t, ok)
+		assert.Nil(t, prev)
+	})
+
+	t.Run("subsequent post returns the previously recorded statuses", func(t *testing.T) {
+		g := newGroupStates(lo)
+		g.shouldPost("g1", "h1", map[string]string{"a": "firing", "b": "resolved"}, now, window)
+		prev, ok := g.shouldPost("g1", "h2", map[string]string{"a": "resolved", "b": "resolved"}, now.Add(time.Minute), window)
+		assert.True(t, ok)
+		assert.Equal(t, map[string]string{"a": "firing", "b": "resolved"}, prev)
+	})
+
+	t.Run("delete forgets statuses, restart amnesia is benign", func(t *testing.T) {
+		g := newGroupStates(lo)
+		g.shouldPost("g1", "h1", map[string]string{"a": "resolved"}, now, window)
+		g.delete("g1")
+		prev, ok := g.shouldPost("g1", "h2", map[string]string{"a": "resolved"}, now.Add(time.Minute), window)
+		assert.True(t, ok)
+		assert.Nil(t, prev)
 	})
 }

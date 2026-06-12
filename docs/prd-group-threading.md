@@ -54,9 +54,14 @@ Thread Google Chat messages by **alert group** (Alertmanager `GroupKey`) instead
 - Exception: a payload whose **state hash** equals the last posted one for that group *and* arrived within a configurable `dedup_window` (default 5m) is dropped as a cluster-race duplicate, with a debug log and a dropped-duplicates metric.
 - The state hash covers only the set of `(fingerprint → status)` pairs — never timestamps or annotation values, which can differ between Alertmanager nodes and would defeat the match.
 
+### Show-resolved-once (refinement, 2026-06-12)
+
+- A resolved instance is rendered as a section **only in the first message after its firing → resolved transition**; subsequent messages omit it (Alertmanager keeps resolved alerts in the group payload for a while, which previously re-showed them on every update). Header counters always cover the full payload, so hidden instances still count in `M resolved`.
+- Implemented by recording the last posted `fingerprint → status` map in the per-group state and filtering sections against it. After a restart (or post-resolve state deletion), an unknown previous status renders the instance — worst case one benign re-show.
+
 ### State lifecycle
 
-- Per-group state (last hash, last post time) is **in-memory only**, deleted when the group's payload shows all alerts resolved, and pruned by a TTL worker as a backstop. Restart amnesia is accepted: worst case is one extra thread and a reset dedup window.
+- Per-group state (last hash, last post time, last fingerprint → status map) is **in-memory only**, deleted when the group's payload shows all alerts resolved, and pruned by a TTL worker as a backstop. Restart amnesia is accepted: worst case is one extra thread and a reset dedup window.
 
 ### Template contract (group mode)
 
