@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -207,6 +208,124 @@ func TestActiveAlerts(t *testing.T) {
 		uuid := aa.loookup("abc123")
 		assert.NotEmpty(t, uuid)
 		assert.Len(t, uuid, 36)
+	})
+
+	t.Run("add and lookup alert by alertname label", func(t *testing.T) {
+		aa := &ActiveAlerts{
+			alerts: make(map[string]AlertDetails),
+			lo:     lo,
+		}
+
+		alert := alertmgrtmpl.Alert{
+			Fingerprint: "abc123",
+			Labels: map[string]string{
+				"alertname": "HighLatency",
+			},
+			StartsAt: time.Now(),
+		}
+
+		err := aa.add(alert)
+		require.NoError(t, err)
+
+		uuid := aa.loookup("HighLatency")
+		assert.NotEmpty(t, uuid)
+		assert.Empty(t, aa.loookup("abc123"))
+	})
+
+	t.Run("threadKey reuses alertname and falls back to fingerprint", func(t *testing.T) {
+		aa := &ActiveAlerts{
+			alerts: make(map[string]AlertDetails),
+			lo:     lo,
+		}
+
+		first, err := aa.threadKey(alertmgrtmpl.Alert{
+			Fingerprint: "first-fingerprint",
+			Labels: map[string]string{
+				"alertname": "HighLatency",
+			},
+			StartsAt: time.Now(),
+		})
+		require.NoError(t, err)
+
+		second, err := aa.threadKey(alertmgrtmpl.Alert{
+			Fingerprint: "second-fingerprint",
+			Labels: map[string]string{
+				"alertname": "HighLatency",
+			},
+			StartsAt: time.Now(),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, first, second)
+
+		missingLabel, err := aa.threadKey(alertmgrtmpl.Alert{
+			Fingerprint: "missing-label",
+			StartsAt:    time.Now(),
+		})
+		require.NoError(t, err)
+
+		blankLabel, err := aa.threadKey(alertmgrtmpl.Alert{
+			Fingerprint: "blank-label",
+			Labels: map[string]string{
+				"alertname": " ",
+			},
+			StartsAt: time.Now(),
+		})
+		require.NoError(t, err)
+
+		assert.NotEqual(t, missingLabel, blankLabel)
+		assert.Equal(t, missingLabel, aa.loookup("missing-label"))
+		assert.Equal(t, blankLabel, aa.loookup("blank-label"))
+	})
+
+	t.Run("threadKey reuses alertname under concurrent access", func(t *testing.T) {
+		aa := &ActiveAlerts{
+			alerts: make(map[string]AlertDetails),
+			lo:     lo,
+		}
+
+		const count = 20
+		results := make(chan string, count)
+		errs := make(chan error, count)
+
+		var wg sync.WaitGroup
+		for i := 0; i < count; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+
+				threadKey, err := aa.threadKey(alertmgrtmpl.Alert{
+					Fingerprint: fmt.Sprintf("fingerprint-%d", i),
+					Labels: map[string]string{
+						"alertname": "HighLatency",
+					},
+					StartsAt: time.Now(),
+				})
+				if err != nil {
+					errs <- err
+					return
+				}
+
+				results <- threadKey
+			}(i)
+		}
+
+		wg.Wait()
+		close(results)
+		close(errs)
+
+		require.Empty(t, errs)
+
+		var first string
+		for threadKey := range results {
+			if first == "" {
+				first = threadKey
+			}
+			assert.Equal(t, first, threadKey)
+		}
+
+		assert.NotEmpty(t, first)
+		assert.Len(t, aa.alerts, 1)
+		assert.Equal(t, first, aa.loookup("HighLatency"))
 	})
 
 	t.Run("lookup non-existent alert returns empty", func(t *testing.T) {

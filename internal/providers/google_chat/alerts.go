@@ -2,6 +2,7 @@ package google_chat
 
 import (
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -10,7 +11,7 @@ import (
 	alertmgrtmpl "github.com/prometheus/alertmanager/template"
 )
 
-// ActiveAlerts represents a map of alerts unique fingerprint hash
+// ActiveAlerts represents a map of active alert tracking keys.
 // with their details.
 type ActiveAlerts struct {
 	lo      *slog.Logger
@@ -24,6 +25,40 @@ type ActiveAlerts struct {
 type AlertDetails struct {
 	StartsAt time.Time
 	UUID     uuid.UUID
+}
+
+func trackingKey(a alertmgrtmpl.Alert) string {
+	if alertName := strings.TrimSpace(a.Labels["alertname"]); alertName != "" {
+		return alertName
+	}
+
+	return a.Fingerprint
+}
+
+// threadKey returns the Google Chat thread key for an alert, creating one if
+// this tracking key is not active yet.
+func (d *ActiveAlerts) threadKey(a alertmgrtmpl.Alert) (string, error) {
+	d.Lock()
+	defer d.Unlock()
+
+	key := trackingKey(a)
+	if details, ok := d.alerts[key]; ok {
+		return details.UUID.String(), nil
+	}
+
+	// Create a UUID for the alert. This UUID is used as threadKey param for the
+	// G-Chat API.
+	uid, err := uuid.NewV4()
+	if err != nil {
+		return "", err
+	}
+
+	d.alerts[key] = AlertDetails{
+		UUID:     uid,
+		StartsAt: a.StartsAt,
+	}
+
+	return uid.String(), nil
 }
 
 // add adds an alert to the active alerts map.
@@ -40,7 +75,7 @@ func (d *ActiveAlerts) add(a alertmgrtmpl.Alert) error {
 	}
 
 	// Add the alert metadata to the map.
-	d.alerts[a.Fingerprint] = AlertDetails{
+	d.alerts[trackingKey(a)] = AlertDetails{
 		UUID:     uid,
 		StartsAt: a.StartsAt,
 	}
@@ -48,16 +83,16 @@ func (d *ActiveAlerts) add(a alertmgrtmpl.Alert) error {
 	return nil
 }
 
-// loookup retrievs the UUID for the alert based on the fingerprint.
-func (d *ActiveAlerts) loookup(fingerprint string) string {
+// loookup retrievs the UUID for the alert based on the tracking key.
+func (d *ActiveAlerts) loookup(trackingKey string) string {
 	d.RLock()
 	defer d.RUnlock()
 
 	// Do a lookup for the provider by the room name and push the alerts.
-	if _, ok := d.alerts[fingerprint]; !ok {
+	if _, ok := d.alerts[trackingKey]; !ok {
 		return ""
 	}
-	return d.alerts[fingerprint].UUID.String()
+	return d.alerts[trackingKey].UUID.String()
 }
 
 // Prune iterates on a list of active alerts inside the map
@@ -75,7 +110,7 @@ func (d *ActiveAlerts) Prune(ttl time.Duration) {
 	for k, a := range d.alerts {
 		// If the alert creation field is past our specified TTL, remove it from the map.
 		if a.StartsAt.Before(expired) {
-			d.lo.Debug("removing alert from active alerts", "fingerprint", k, "created", a.StartsAt, "expired", expired)
+			d.lo.Debug("removing alert from active alerts", "tracking_key", k, "created", a.StartsAt, "expired", expired)
 			delete(d.alerts, k)
 		}
 	}

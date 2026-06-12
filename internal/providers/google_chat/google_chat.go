@@ -193,9 +193,11 @@ func (m *GoogleChatManager) Push(alerts []alertmgrtmpl.Alert) error {
 
 		m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_total{provider="%s", room="%s"}`, m.ID(), m.Room()))
 
-		// If it's a new alert whose fingerprint isn't in the active alerts map, add it first.
-		if m.activeAlerts.loookup(a.Fingerprint) == "" {
-			m.activeAlerts.add(a)
+		threadKey, err := m.activeAlerts.threadKey(a)
+		if err != nil {
+			m.lo.Error("error getting google chat thread key", "error", err)
+			m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="preparing"}`, m.ID(), m.Room()))
+			continue
 		}
 
 		// Prepare a list of messages to send.
@@ -208,8 +210,6 @@ func (m *GoogleChatManager) Push(alerts []alertmgrtmpl.Alert) error {
 
 		// Dispatch an HTTP request for each message.
 		for _, msg := range msgs {
-			var threadKey = m.activeAlerts.alerts[a.Fingerprint].UUID.String()
-
 			// Send message to API.
 			if m.dryRun {
 				m.lo.Info("dry_run is enabled for this room. skipping pushing notification", "room", m.Room())
