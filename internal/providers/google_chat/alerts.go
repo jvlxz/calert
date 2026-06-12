@@ -6,26 +6,34 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gofrs/uuid"
 	"github.com/mr-karan/calert/internal/metrics"
 	alertmgrtmpl "github.com/prometheus/alertmanager/template"
 )
 
 // ActiveAlerts represents a map of active alert tracking keys.
 type ActiveAlerts struct {
-	lo      *slog.Logger
-	metrics *metrics.Manager
+	lo            *slog.Logger
+	metrics       *metrics.Manager
+	anchorHourUTC int
+	now           func() time.Time
 	sync.RWMutex
 	alerts map[string]AlertDetails
 }
 
-// AlertDetails stores the Google Chat thread and current known instances for a
-// tracking key.
+// AlertDetails stores the current known instances for a tracking key.
 type AlertDetails struct {
 	StartsAt time.Time
-	UUID     uuid.UUID
 	Alerts   map[string]alertmgrtmpl.Alert
 	Order    []string
+}
+
+// clock returns the current time, using the injected clock when set.
+func (d *ActiveAlerts) clock() time.Time {
+	if d.now != nil {
+		return d.now()
+	}
+
+	return time.Now()
 }
 
 // AlertGroup is the template context for a consolidated Google Chat message.
@@ -86,18 +94,14 @@ func (d *ActiveAlerts) apply(alerts []alertmgrtmpl.Alert) ([]AlertGroup, error) 
 		updatedGroups[key] = append(updatedGroups[key], alert)
 	}
 
+	bucket := threadBucket(d.clock(), d.anchorHourUTC)
+
 	groups := make([]AlertGroup, 0, len(groupOrder))
 	for _, key := range groupOrder {
 		details, ok := d.alerts[key]
 		if !ok {
-			uid, err := uuid.NewV4()
-			if err != nil {
-				return groups, err
-			}
-
 			details = AlertDetails{
 				StartsAt: updatedGroups[key][0].StartsAt,
-				UUID:     uid,
 				Alerts:   make(map[string]alertmgrtmpl.Alert),
 				Order:    make([]string, 0, len(updatedGroups[key])),
 			}
@@ -114,7 +118,7 @@ func (d *ActiveAlerts) apply(alerts []alertmgrtmpl.Alert) ([]AlertGroup, error) 
 			details.Alerts[alertKey] = alert
 		}
 
-		group := details.group(key)
+		group := details.group(key, deterministicThreadKey(key, bucket))
 		if group.FiringCount == 0 {
 			details.Alerts = make(map[string]alertmgrtmpl.Alert)
 			details.Order = nil
@@ -127,7 +131,7 @@ func (d *ActiveAlerts) apply(alerts []alertmgrtmpl.Alert) ([]AlertGroup, error) 
 	return groups, nil
 }
 
-func (d AlertDetails) group(key string) AlertGroup {
+func (d AlertDetails) group(key, threadKey string) AlertGroup {
 	alerts := make([]alertmgrtmpl.Alert, 0, len(d.Order))
 	for _, alertKey := range d.Order {
 		alert, ok := d.Alerts[alertKey]
@@ -142,7 +146,7 @@ func (d AlertDetails) group(key string) AlertGroup {
 		Count:       len(alerts),
 		TrackingKey: key,
 		AlertName:   key,
-		ThreadKey:   d.UUID.String(),
+		ThreadKey:   threadKey,
 	}
 	group.Status = "resolved"
 
@@ -183,7 +187,7 @@ func (d *ActiveAlerts) add(a alertmgrtmpl.Alert) error {
 	return err
 }
 
-// loookup returns the Google Chat thread key UUID for a tracking key.
+// loookup returns the Google Chat thread key for a tracked tracking key.
 func (d *ActiveAlerts) loookup(trackingKey string) string {
 	d.RLock()
 	defer d.RUnlock()
@@ -191,7 +195,7 @@ func (d *ActiveAlerts) loookup(trackingKey string) string {
 	if _, ok := d.alerts[trackingKey]; !ok {
 		return ""
 	}
-	return d.alerts[trackingKey].UUID.String()
+	return deterministicThreadKey(trackingKey, threadBucket(d.clock(), d.anchorHourUTC))
 }
 
 // Prune iterates the list of active alerts inside the map

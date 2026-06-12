@@ -84,9 +84,10 @@ Example:
 |  `providers.<room_name>.max_idle_conns` 	| Maximum Keep Alive connections to keep in the pool.  	| yes | `50` |
 |  `providers.<room_name>.timeout` 	| Timeout for making HTTP requests to the webhook URL.  	| yes | `30s` |
 |  `providers.<room_name>.template` 	| Template for rendering a formatted Alert notification.  	| yes | `static/message.tmpl` |
-|  `providers.<room_name>.thread_ttl` 	| Timeout to keep active alerts in memory. Once this TTL expires, a new thread will be created.	| yes | `12h` |
+|  `providers.<room_name>.thread_ttl` 	| Timeout to keep active alert instance state (counters, grouped instances) in memory.	| yes | `12h` |
 |  `providers.<room_name>.proxy_url` 	| Specify `proxy_url` as your proxy endpoint to route all HTTP requests to the provider via a proxy. | no | - |
 |  `providers.<room_name>.threaded_replies` 	| Whether to send threaded replies or not. | no | false |
+|  `providers.<room_name>.thread_anchor_hour_utc` 	| UTC hour (0-23) at which a new thread starts each day per alert name. Pick your quietest hour to minimise incidents split across the daily rotation. | no | `4` |
 |  `providers.<room_name>.dry_run` 	| In case you're simply experimenting with `calert` config changes and you don't wish to send _actual_ notifications, you can set true. | no | false |
 |  `providers.<room_name>.retry_max` 	| Maximum number of retries | no | `3` |
 |  `providers.<room_name>.retry_wait_min` 	| Minimum time to wait before retrying | no | `1s` |
@@ -180,11 +181,10 @@ receivers:
 
 ### Understanding repeat_interval
 
-Alertmanager's `repeat_interval` controls how often alerts are re-sent while still firing. When using `calert` with `threaded_replies=true`, repeated alerts will be posted to the same thread (within the `thread_ttl` window). This is **expected behavior** - it ensures your team sees that an alert is still active.
+Alertmanager's `repeat_interval` controls how often alerts are re-sent while still firing. When using `calert` with `threaded_replies=true`, repeated alerts will be posted to the same thread (within the same daily thread bucket). This is **expected behavior** - it ensures your team sees that an alert is still active.
 
 If you want fewer repeated messages:
 - Increase `repeat_interval` in Alertmanager config
-- Increase `thread_ttl` in calert config to keep alerts in the same thread longer
 
 ### Kubernetes AlertmanagerConfig
 
@@ -209,10 +209,10 @@ spec:
 
 Alertmanager currently doesn't send any _Unique Identifier_ for each Alert. The use-case of sending related alerts under the same thread is helpful to triage similar alerts and see all their different states (_Firing_, _Resolved_) for people consuming these alerts. `calert` tries to solve this by:
 
-- Use the `fingerprint` field present in the Alert. This field is computed by hashing the labels for an alert.
-- Create a map of `active_alerts` in memory. Add an alert by it's fingerprint and generate a random `UUID.v4` and store that in the map (along with some more meta-data like `startAt` field).
-- Use `?threadKey=uuid` query param while making a request to Google Chat. This ensures that all alerts with same fingerprint (=_same labels_) go under the same thread.
-- A background worker runs _every hour_ which scans the map of `active_alerts`. It checks whether the alert's `startAt` field has crossed the TTL (as specified by `thread_ttl`). If the TTL is expired then the `alert` is removed from the map. This ensures that the map of `active_alerts` doesn't grow unbounded and after a certain TTL all alerts are sent to a new thread.
+- Group alerts by a _tracking key_: the `alertname` label when present, falling back to the alert's `fingerprint` (a hash of its labels).
+- Derive the `?threadKey=` query param **deterministically**: `sha256(tracking key + daily bucket)`, where the bucket is the current 24h window anchored at `thread_anchor_hour_utc`. Because the key is computed from the alert labels and the wall clock — not stored — any calert instance (including HA pairs behind clustered Alertmanagers, or a freshly restarted process) produces the same thread key, so firing and resolved notifications always converge on the same thread. A new thread starts once per day at the anchor hour.
+- Keep a map of `active_alerts` in memory, used only to aggregate instance state (firing/resolved counters, grouped instances) for rendering — it does not affect thread identity.
+- A background worker runs _every hour_ which scans the map of `active_alerts`. It checks whether the alert's `startAt` field has crossed the TTL (as specified by `thread_ttl`). If the TTL is expired then the `alert` is removed from the map. This ensures that the map of `active_alerts` doesn't grow unbounded.
 
 ## Prometheus Metrics
 

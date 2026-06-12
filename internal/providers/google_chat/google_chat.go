@@ -44,9 +44,13 @@ type GoogleChatOpts struct {
 	Template        string
 	ThreadTTL       time.Duration
 	ThreadedReplies bool
-	RetryMax        int
-	RetryWaitMin    time.Duration
-	RetryWaitMax    time.Duration
+	// ThreadAnchorHourUTC is the UTC hour (0-23) at which the daily thread
+	// rotation happens. Pick the quietest hour to minimise threads split
+	// across the boundary.
+	ThreadAnchorHourUTC int
+	RetryMax            int
+	RetryWaitMin        time.Duration
+	RetryWaitMax        time.Duration
 }
 
 // NewGoogleChat initializes a Google Chat provider object.
@@ -88,6 +92,10 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 		}
 
 		return false, nil
+	}
+
+	if opts.ThreadAnchorHourUTC < 0 || opts.ThreadAnchorHourUTC > 23 {
+		return nil, fmt.Errorf("thread_anchor_hour_utc must be between 0 and 23, got %d", opts.ThreadAnchorHourUTC)
 	}
 
 	// Initialise the map of active alerts.
@@ -178,9 +186,10 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 		endpoint: opts.Endpoint,
 		room:     opts.Room,
 		activeAlerts: &ActiveAlerts{
-			alerts:  alerts,
-			lo:      opts.Log,
-			metrics: opts.Metrics,
+			alerts:        alerts,
+			lo:            opts.Log,
+			metrics:       opts.Metrics,
+			anchorHourUTC: opts.ThreadAnchorHourUTC,
 		},
 		msgTmpl:         tmpl,
 		dryRun:          opts.DryRun,

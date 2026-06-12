@@ -226,9 +226,9 @@ func TestActiveAlerts(t *testing.T) {
 		err := aa.add(alert)
 		require.NoError(t, err)
 
-		uuid := aa.loookup("abc123")
-		assert.NotEmpty(t, uuid)
-		assert.Len(t, uuid, 36)
+		key := aa.loookup("abc123")
+		assert.NotEmpty(t, key)
+		assert.Len(t, key, 64)
 	})
 
 	t.Run("add and lookup alert by alertname label", func(t *testing.T) {
