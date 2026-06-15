@@ -16,6 +16,7 @@ import (
 	"github.com/mr-karan/calert/internal/metrics"
 	"github.com/mr-karan/calert/internal/providers"
 	alertmgrtmpl "github.com/prometheus/alertmanager/template"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 )
@@ -34,7 +35,7 @@ type GoogleChatManager struct {
 	threadTTL       time.Duration
 	dedupWindow     time.Duration
 	maxAlertsPerMsg int
-	groupStates     *groupStates
+	groupStore      groupStateStore
 }
 
 const (
@@ -64,6 +65,13 @@ type GoogleChatOpts struct {
 	RetryMax        int
 	RetryWaitMin    time.Duration
 	RetryWaitMax    time.Duration
+
+	// Optional shared dedup state for active-active deployments. When
+	// RedisAddress is empty, group state stays in memory (default).
+	RedisAddress   string
+	RedisPassword  string
+	RedisDB        int
+	RedisKeyPrefix string
 }
 
 // NewGoogleChat initializes a Google Chat provider object.
@@ -198,7 +206,6 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 		threadTTL:       opts.ThreadTTL,
 		dedupWindow:     opts.DedupWindow,
 		maxAlertsPerMsg: opts.MaxAlertsPerMsg,
-		groupStates:     newGroupStates(opts.Log),
 	}
 	if mgr.threadingMode == "" {
 		mgr.threadingMode = ThreadingModeAlert
@@ -211,9 +218,24 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 	}
 	// Start a background worker to cleanup alerts based on TTL mechanism.
 	go mgr.activeAlerts.startPruneWorker(1*time.Hour, opts.ThreadTTL)
-	// Backstop pruner for group-mode state, for groups that never report a
-	// fully-resolved payload.
-	go mgr.groupStates.startPruneWorker(1*time.Hour, opts.ThreadTTL)
+
+	// Select the group dedup store. With Redis configured, both calert
+	// instances share state; otherwise state is per-process in memory.
+	if opts.RedisAddress != "" {
+		client := redis.NewClient(&redis.Options{
+			Addr:     opts.RedisAddress,
+			Password: opts.RedisPassword,
+			DB:       opts.RedisDB,
+		})
+		mgr.groupStore = newRedisStore(opts.Log, client, opts.RedisKeyPrefix, mgr.threadTTL)
+		opts.Log.Info("group dedup state shared via redis", "address", opts.RedisAddress, "key_prefix", opts.RedisKeyPrefix)
+	} else {
+		mem := newMemoryStore(opts.Log)
+		// Backstop pruner for groups that never report a fully-resolved
+		// payload. Redis uses key TTLs instead, so this is memory-only.
+		go mem.startPruneWorker(1*time.Hour, opts.ThreadTTL)
+		mgr.groupStore = mem
+	}
 
 	return mgr, nil
 }
@@ -241,14 +263,30 @@ func (m *GoogleChatManager) pushGroup(payload providers.WebhookPayload) error {
 	m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_total{provider="%s", room="%s"}`, m.ID(), m.Room()))
 
 	// Drop cluster-race duplicates: same alert states, posted moments ago.
-	prevStatuses, post := m.groupStates.shouldPost(payload.GroupKey, hash, statusesOf(payload.Alerts), now, m.dedupWindow)
-	if !post {
+	prevStatuses, post, err := m.groupStore.shouldPost(payload.GroupKey, hash, statusesOf(payload.Alerts), now, m.dedupWindow)
+	if err != nil {
+		// Fail open: a dedup-store outage must never drop an alert. Worst
+		// case is the duplicate we already tolerate today.
+		m.lo.Warn("group dedup store unavailable, posting anyway", "error", err, "group_key", payload.GroupKey)
+		m.metrics.Increment(fmt.Sprintf(`group_dedup_store_errors_total{provider="%s", room="%s"}`, m.ID(), m.Room()))
+		prevStatuses, post = nil, true
+	} else if !post {
 		m.lo.Debug("suppressing duplicate group notification", "group_key", payload.GroupKey, "state_hash", hash)
 		m.metrics.Increment(fmt.Sprintf(`alerts_deduplicated_total{provider="%s", room="%s"}`, m.ID(), m.Room()))
 		return nil
 	}
 
 	tmplCtx := buildGroupContext(payload, threadKey, m.maxAlertsPerMsg, prevStatuses)
+
+	// Nothing new to render: every instance in this payload was already shown
+	// (e.g. an all-resolved re-send after the dedup window, or a payload of
+	// only already-resolved instances re-sent when a new member fires). Skip
+	// so we don't post an empty card. The first firing→resolved transition
+	// still renders, since that instance isn't yet recorded as resolved.
+	if len(tmplCtx.Alerts) == 0 {
+		m.lo.Debug("no new alerts to render for group, skipping", "group_key", payload.GroupKey)
+		return nil
+	}
 
 	msgs, err := m.prepareMessage(tmplCtx)
 	if err != nil {
@@ -270,11 +308,11 @@ func (m *GoogleChatManager) pushGroup(payload providers.WebhookPayload) error {
 	}
 	m.metrics.Duration(fmt.Sprintf(`alerts_dispatched_duration_seconds{provider="%s", room="%s"}`, m.ID(), m.Room()), now)
 
-	// All instances resolved: the incident is over, forget the group.
-	if tmplCtx.FiringCount == 0 {
-		m.groupStates.delete(payload.GroupKey)
-	}
-
+	// Group state is intentionally NOT deleted on full resolve: Alertmanager
+	// keeps recently-resolved members in the group and re-sends them when a new
+	// member fires, so we must remember they were already shown to suppress
+	// them. The store's TTL (thread_ttl) is the backstop that forgets the group
+	// once the incident is genuinely over.
 	return nil
 }
 

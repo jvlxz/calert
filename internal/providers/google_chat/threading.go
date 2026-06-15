@@ -56,16 +56,30 @@ func statusesOf(alerts []alertmgrtmpl.Alert) map[string]string {
 	return statuses
 }
 
-// groupStates tracks per-group posting state, in memory only. Losing it on
+// groupStateStore is the dispatch path's view of group dedup state. It has a
+// memory implementation (default) and a Redis implementation (shared across
+// active-active instances). The dispatcher is agnostic to which one it holds.
+//
+// shouldPost returns post=false only for a cluster-race duplicate, the new
+// state plus the *previous* statuses otherwise, and a non-nil err when the
+// store was unreachable — on err the dispatcher fails open and posts anyway.
+// delete is intentionally absent: group state is never deleted on the dispatch
+// path (pushGroup relies on TTL to reap state, not explicit deletes). Both
+// implementations keep a delete method for tests only.
+type groupStateStore interface {
+	shouldPost(groupKey, hash string, statuses map[string]string, now time.Time, window time.Duration) (map[string]string, bool, error)
+}
+
+// memoryStore tracks per-group posting state, in memory only. Losing it on
 // restart costs at most one duplicate message and a reset dedup window.
-type groupStates struct {
+type memoryStore struct {
 	lo *slog.Logger
 	sync.Mutex
 	groups map[string]groupState
 }
 
-func newGroupStates(lo *slog.Logger) *groupStates {
-	return &groupStates{
+func newMemoryStore(lo *slog.Logger) *memoryStore {
+	return &memoryStore{
 		lo:     lo,
 		groups: make(map[string]groupState),
 	}
@@ -76,22 +90,22 @@ func newGroupStates(lo *slog.Logger) *groupStates {
 // hash arriving within the dedup window of the last post. When it returns
 // true, the new state (hash and fingerprint → status pairs) is recorded and
 // the *previous* statuses are returned, so the caller can omit instances
-// already shown as resolved.
-func (g *groupStates) shouldPost(groupKey, hash string, statuses map[string]string, now time.Time, window time.Duration) (map[string]string, bool) {
+// already shown as resolved. The memory store never errors.
+func (g *memoryStore) shouldPost(groupKey, hash string, statuses map[string]string, now time.Time, window time.Duration) (map[string]string, bool, error) {
 	g.Lock()
 	defer g.Unlock()
 
 	st, ok := g.groups[groupKey]
 	if ok && st.lastHash == hash && now.Sub(st.lastPost) < window {
-		return nil, false
+		return nil, false, nil
 	}
 
 	g.groups[groupKey] = groupState{lastHash: hash, lastPost: now, lastStatuses: statuses}
-	return st.lastStatuses, true
+	return st.lastStatuses, true, nil
 }
 
 // delete removes a group's state, called when all of its alerts resolved.
-func (g *groupStates) delete(groupKey string) {
+func (g *memoryStore) delete(groupKey string) {
 	g.Lock()
 	defer g.Unlock()
 	delete(g.groups, groupKey)
@@ -99,7 +113,7 @@ func (g *groupStates) delete(groupKey string) {
 
 // prune removes groups whose last post is older than ttl, as a backstop for
 // groups that never report a fully-resolved payload.
-func (g *groupStates) prune(now time.Time, ttl time.Duration) {
+func (g *memoryStore) prune(now time.Time, ttl time.Duration) {
 	g.Lock()
 	defer g.Unlock()
 
@@ -113,7 +127,7 @@ func (g *groupStates) prune(now time.Time, ttl time.Duration) {
 
 // startPruneWorker periodically prunes stale group state. Blocking; run as a
 // goroutine.
-func (g *groupStates) startPruneWorker(pruneInterval, ttl time.Duration) {
+func (g *memoryStore) startPruneWorker(pruneInterval, ttl time.Duration) {
 	for range time.NewTicker(pruneInterval).C {
 		g.prune(time.Now(), ttl)
 	}

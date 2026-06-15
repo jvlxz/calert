@@ -133,6 +133,10 @@ func initProviders(ko *koanf.Koanf, lo *slog.Logger, metrics *metrics.Manager) (
 				RetryMax:        ko.Int(fmt.Sprintf("%s.retry_max", cfgKey)),
 				RetryWaitMin:    ko.Duration(fmt.Sprintf("%s.retry_wait_min", cfgKey)),
 				RetryWaitMax:    ko.Duration(fmt.Sprintf("%s.retry_wait_max", cfgKey)),
+				RedisAddress:    ko.String(fmt.Sprintf("%s.redis.address", cfgKey)),
+				RedisPassword:   ko.String(fmt.Sprintf("%s.redis.password", cfgKey)),
+				RedisDB:         ko.Int(fmt.Sprintf("%s.redis.db", cfgKey)),
+				RedisKeyPrefix:  ko.String(fmt.Sprintf("%s.redis.key_prefix", cfgKey)),
 			}
 			lo.Debug("provider options", "type", provType, "options", opts)
 
