@@ -93,7 +93,7 @@ func initProviders(ko *koanf.Koanf, lo *slog.Logger, metrics *metrics.Manager) (
 		"thread_ttl":             "12h",
 		"threaded_replies":       false,
 		"threading_mode":         "alert",
-		"dedup_window":           "5m",
+		"dedup_window":           "2m",
 		"max_alerts_per_message": 10,
 		"dry_run":                false,
 		"retry_max":              3,

@@ -216,6 +216,13 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 	if mgr.threadingMode != ThreadingModeAlert && mgr.threadingMode != ThreadingModeGroup {
 		return nil, fmt.Errorf("invalid threading_mode %q: must be %q or %q", mgr.threadingMode, ThreadingModeAlert, ThreadingModeGroup)
 	}
+	// Group mode is threaded by definition (one thread per alert group), so it
+	// ignores threaded_replies. Force it on and tell the operator, rather than
+	// silently honouring a flag that can't apply.
+	if mgr.threadingMode == ThreadingModeGroup && !mgr.threadedReplies {
+		opts.Log.Warn("threaded_replies is ignored in group threading mode; threading is always on", "room", mgr.room)
+		mgr.threadedReplies = true
+	}
 	// Start a background worker to cleanup alerts based on TTL mechanism.
 	go mgr.activeAlerts.startPruneWorker(1*time.Hour, opts.ThreadTTL)
 
@@ -260,7 +267,6 @@ func (m *GoogleChatManager) pushGroup(payload providers.WebhookPayload) error {
 	)
 
 	m.lo.Info("dispatching group notification to google chat", "group_key", payload.GroupKey, "count", len(payload.Alerts))
-	m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_total{provider="%s", room="%s"}`, m.ID(), m.Room()))
 
 	// Drop cluster-race duplicates: same alert states, posted moments ago.
 	prevStatuses, post, err := m.groupStore.shouldPost(payload.GroupKey, hash, statusesOf(payload.Alerts), now, m.dedupWindow)
@@ -300,12 +306,17 @@ func (m *GoogleChatManager) pushGroup(payload providers.WebhookPayload) error {
 			m.lo.Info("dry_run is enabled for this room. skipping pushing notification", "room", m.Room())
 			continue
 		}
-		if err := m.sendMessage(msg, threadKey, true); err != nil {
+		// threadedReplies is forced true for group mode in the constructor.
+		if err := m.sendMessage(msg, threadKey, m.threadedReplies); err != nil {
 			m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="sending"}`, m.ID(), m.Room()))
 			m.lo.Error("error sending group message", "error", err)
 			return err
 		}
 	}
+	// Count in alert-units (not payloads) so alerts_dispatched_total keeps the
+	// same meaning as alert mode, and only after a real send so it never
+	// overlaps alerts_deduplicated_total.
+	m.metrics.IncrementBy(fmt.Sprintf(`alerts_dispatched_total{provider="%s", room="%s"}`, m.ID(), m.Room()), len(payload.Alerts))
 	m.metrics.Duration(fmt.Sprintf(`alerts_dispatched_duration_seconds{provider="%s", room="%s"}`, m.ID(), m.Room()), now)
 
 	// Group state is intentionally NOT deleted on full resolve: Alertmanager
