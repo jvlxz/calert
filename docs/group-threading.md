@@ -4,9 +4,6 @@ How to run calert so an incident's whole lifecycle (firing → partially
 resolved → fully resolved) lands in **one** Google Chat thread instead of one
 thread per alert.
 
-For the design rationale see [prd-group-threading.md](prd-group-threading.md)
-and [redis-shared-state-prd.md](redis-shared-state-prd.md).
-
 ## When to use what
 
 | Deployment | `threading_mode` | Redis |
