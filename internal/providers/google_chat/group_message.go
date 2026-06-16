@@ -40,21 +40,13 @@ type GroupTemplateContext struct {
 // prevStatuses holds the fingerprint → status pairs of the previously posted
 // message for this group (nil when unknown). A resolved instance is rendered
 // only on its firing → resolved transition: once shown as resolved, it is
-// dropped from later messages' sections. Header counters always cover the
-// full payload, so hidden instances still count as resolved.
+// dropped from later messages' sections. Header counters reflect the
+// rendered set (plus overflow), so hidden instances are not counted.
 func buildGroupContext(payload providers.WebhookPayload, trackingKey string, maxAlerts int, prevStatuses map[string]string) GroupTemplateContext {
 	ctx := GroupTemplateContext{
 		AlertName:   payload.GroupLabels["alertname"],
 		Status:      payload.Status,
 		TrackingKey: trackingKey,
-	}
-
-	for _, a := range payload.Alerts {
-		if a.Status == "firing" {
-			ctx.FiringCount++
-		} else {
-			ctx.ResolvedCount++
-		}
 	}
 
 	// Copy CommonLabels so the severity fallback never mutates the payload.
@@ -75,6 +67,17 @@ func buildGroupContext(payload providers.WebhookPayload, trackingKey string, max
 	sort.SliceStable(alerts, func(i, j int) bool {
 		return alerts[i].Status == "firing" && alerts[j].Status != "firing"
 	})
+
+	// Count over the rendered set (post show-resolved-once filter) so the
+	// header matches what's visible. Overflow items are still counted here
+	// since they're surfaced in the overflow summary, not dropped.
+	for _, a := range alerts {
+		if a.Status == "firing" {
+			ctx.FiringCount++
+		} else {
+			ctx.ResolvedCount++
+		}
+	}
 
 	if len(alerts) > 0 {
 		first := alerts[0]

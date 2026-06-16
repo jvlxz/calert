@@ -164,8 +164,8 @@ func TestGroupTemplateRendersValidCardsV2(t *testing.T) {
 func TestBuildGroupContextHidesAlreadyShownResolved(t *testing.T) {
 	// Scenario from the field: node2 resolved and was shown as resolved in
 	// the previous message; gitlab1 resolves next. The new message must
-	// render gitlab1's transition but not re-show node2, while counters
-	// keep covering the full payload.
+	// render gitlab1's transition but not re-show node2, and counters reflect
+	// only the rendered set so the header matches what's visible.
 	payload := groupPayload(
 		groupAlert("a", "firing", "node1"),
 		groupAlert("b", "resolved", "node2"),
@@ -178,9 +178,9 @@ func TestBuildGroupContextHidesAlreadyShownResolved(t *testing.T) {
 	require.Len(t, ctx.Alerts, 2)
 	assert.Equal(t, "a", ctx.Alerts[0].Fingerprint)
 	assert.Equal(t, "c", ctx.Alerts[1].Fingerprint)
-	// Hidden instances still count in the header.
+	// Hidden node2 is not counted: header counts only the rendered set.
 	assert.Equal(t, 1, ctx.FiringCount)
-	assert.Equal(t, 2, ctx.ResolvedCount)
+	assert.Equal(t, 1, ctx.ResolvedCount)
 
 	t.Run("unknown previous status is rendered", func(t *testing.T) {
 		ctx := buildGroupContext(payload, "tk", 10, map[string]string{"a": "firing"})

@@ -216,7 +216,7 @@ func testGroupModeShowsResolvedOnlyOnce(t *testing.T, backend string) {
 	assert.Contains(t, srv.lastBody(), "node2")
 
 	// node1 resolves next: node2 was already shown as resolved and must
-	// not reappear, but it still counts in the header.
+	// not reappear, and the header counts only the rendered node1.
 	require.NoError(t, chat.Push(groupPayload(
 		groupAlert("a", "resolved", "node1"),
 		groupAlert("b", "resolved", "node2"),
@@ -224,6 +224,6 @@ func testGroupModeShowsResolvedOnlyOnce(t *testing.T, backend string) {
 	body := srv.lastBody()
 	assert.Contains(t, body, "node1")
 	assert.NotContains(t, body, "node2")
-	assert.Contains(t, body, "0 firing / 2 resolved")
+	assert.Contains(t, body, "0 firing / 1 resolved")
 	assert.Len(t, srv.keys(), 3)
 }
